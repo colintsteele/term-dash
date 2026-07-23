@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# termdash — tmux dashboard, 3-column layout:
+#   [left, 15%: local-status / worktrees]  [middle, 70%: fat terminal]  [right, 15%: git-notiql / Notion to-do]
+#
+# git-notiql moved to the top-right column here. Given how inconsistent its
+# emoji rendering has been across different layout attempts in testing,
+# this position isn't guaranteed to work — worth confirming fresh rather
+# than assuming it carries over from an earlier layout.
+#
+# USAGE:
+#   termdash up        start the dashboard (or attach if already running)
+#   termdash down      kill the dashboard session
+#   termdash restart   down, then up
+#   termdash status     show what's running in each pane
+#
+# INSTALL:
+#   Leave this file inside the term-dash folder. Alias it, e.g. in ~/.zshrc:
+#     alias termdash="~/code/term-dash/termdash"
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# CONFIG — edit to match your actual filenames.
+# Layout: [left, 15% width] [middle, 70% width] [right, 15% width]
+#   left column:  top = local-status (small), bottom = worktrees (remainder,
+#                 our CI-focused panel — CI status is folded into each row)
+#   middle:       plain terminal, no command — just a normal shell
+#   right column: top = git-notiql (remainder), bottom = Notion to-do adder
+# ---------------------------------------------------------------------------
+
+SESSION="termdash"
+DASHBOARD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+LEFT_WIDTH_PCT=15
+RIGHT_WIDTH_PCT=15
+# middle gets whatever's left (~70%)
+
+# local-status prints a single line today; 2 rows leaves headroom in case it
+# grows to a second line without the pane clipping it.
+LEFT_TOP_HEIGHT=2
+LEFT_TOP_CMD="npx tsx local-status.ts"
+# worktrees panel — replaces the standalone circleci panel; CI status is folded
+# into each worktree row (colored ● dot), so this is now our CI-focused panel.
+LEFT_BOTTOM_CMD="npx tsx cursor-status.ts"
+
+# right column: git-notiql takes the remainder (top), Notion to-do fixed (bottom)
+RIGHT_TOP_CMD="npx tsx git-notiql.ts"
+RIGHT_BOTTOM_HEIGHT=4
+RIGHT_BOTTOM_CMD="npx tsx notion-todo.ts"
+
+# ---------------------------------------------------------------------------
+
+session_exists() {
+  tmux has-session -t "$SESSION" 2>/dev/null
+}
+
+attach_or_switch() {
+  if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "$SESSION"
+  else
+    tmux attach -t "$SESSION"
+  fi
+}
+
+up() {
+  if session_exists; then
+    echo "termdash is already running — attaching"
+    attach_or_switch
+    return
+  fi
+
+  tmux new-session -d -s "$SESSION" -n dashboard -c "$DASHBOARD_DIR"
+  remainder=$(tmux display-message -p -t "$SESSION:dashboard" '#{pane_id}')
+
+  # peel the LEFT column off first (this pane keeps its id, shrinks to the
+  # right, and becomes the middle pane once the right column is also peeled)
+  left_pane=$(tmux split-window -h -b -p "$LEFT_WIDTH_PCT" -t "$remainder" \
+    -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
+
+  # peel the RIGHT column off what's left. RIGHT_WIDTH_PCT is a fraction of
+  # the TOTAL width, but at this point "remainder" is only (100-LEFT)% of
+  # total — so convert to a percentage of the current remainder first.
+  right_pct_of_remainder=$(( RIGHT_WIDTH_PCT * 100 / (100 - LEFT_WIDTH_PCT) ))
+  right_pane=$(tmux split-window -h -p "$right_pct_of_remainder" -t "$remainder" \
+    -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
+  # remainder is now the middle pane — deliberately left as a plain shell,
+  # no command sent
+
+  # left column: top = local-status (fixed height), bottom = circleci
+  # (whatever's left) — left_pane keeps its id and becomes the bottom pane
+  left_top=$(tmux split-window -v -b -l "$LEFT_TOP_HEIGHT" -t "$left_pane" \
+    -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
+  tmux send-keys -t "$left_top" "clear && $LEFT_TOP_CMD" Enter
+  tmux send-keys -t "$left_pane" "clear && $LEFT_BOTTOM_CMD" Enter
+
+  # right column, top→bottom: git-notiql (remainder), Notion to-do (fixed,
+  # small). Peel the fixed bottom pane off; right_pane keeps its id and stays
+  # the top pane, taking whatever height is left over.
+  right_bottom=$(tmux split-window -v -l "$RIGHT_BOTTOM_HEIGHT" -t "$right_pane" \
+    -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
+  tmux send-keys -t "$right_pane" "clear && $RIGHT_TOP_CMD" Enter
+  tmux send-keys -t "$right_bottom" "clear && $RIGHT_BOTTOM_CMD" Enter
+
+  tmux select-pane -t "$remainder"
+  attach_or_switch
+}
+
+down() {
+  if session_exists; then
+    tmux kill-session -t "$SESSION"
+    echo "termdash stopped"
+  else
+    echo "termdash isn't running"
+  fi
+}
+
+status() {
+  if session_exists; then
+    echo "termdash is running:"
+    tmux list-panes -t "$SESSION:dashboard" \
+      -F '  pane #{pane_index}: #{pane_current_command}  (#{pane_width}x#{pane_height})'
+  else
+    echo "termdash is not running"
+  fi
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  up) up ;;
+  down) down ;;
+  restart) down; sleep 0.3; up ;;
+  status) status ;;
+  *)
+    echo "Usage: termdash {up|down|restart|status}"
+    exit 1
+    ;;
+esac

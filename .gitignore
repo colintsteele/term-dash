@@ -1,0 +1,19 @@
+# Large binaries / installers — never commit (GitHub rejects >100MB)
+*.dmg
+Claude.dmg
+
+# Machine-local Claude Code settings (personal permission allowlist)
+.claude/settings.local.json
+
+# Env files — tokens live here (CIRCLECI_TOKEN, GITHUB_TOKEN, NOTION_TOKEN, …)
+.env
+.env.*
+
+# Node
+node_modules/
+
+# Logs / scratch
+*.log
+
+# macOS
+.DS_Store
