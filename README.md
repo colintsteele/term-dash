@@ -105,24 +105,30 @@ term-dash is this worktree panel plus a few sibling widgets, tiled by the
 
 ```
 ┌──────────────┬────────────────────────────┬──────────────┐
-│ local-status │                            │  git-notiql  │
-├──────────────┤      fat terminal          ├──────────────┤
-│              │      (plain shell)         │  cursor-     │
-│  worktrees   │                            │  status      │
-│  + agents    ├────────────────────────────┤  (worktrees) │
-│              │   mini terminal (shell)    ├──────────────┤
-│              │                            │ notion-todo  │
+│ local-status │                            │              │
+├──────────────┤                            │  git-notiql  │
+│              │        plain shell         │              │
+│  worktrees   │      (your terminal)       │              │
+│  + agents    │                            ├──────────────┤
+│ (cursor-     │                            │              │
+│  status)     │                            │ notion-todo  │
 └──────────────┴────────────────────────────┴──────────────┘
    left, 15%            middle, 70%              right, 15%
 ```
 
-- **`git-notiql`** — GitHub PR radar: replies on your PRs, threads you're in, review requests, team PRs needing review.
+- **`git-notiql`** — GitHub PR radar: badges for replies on your own PRs, participating threads where you're waiting on a reply, and pending review requests. (Cmd-click a badge → the comment.)
 - **`local-status`** — CPU / memory / what's on port 3000.
 - **`notion-todo`** — type a to-do, Enter, it lands under this week's toggle in Notion.
 - **middle panes** — plain shells for actual work.
 
 Every widget is the same shape: small, self-refreshing, colored, OSC-8 clickable
 links (iTerm2). Swap what runs where in the `CONFIG` block of `termdash`.
+
+> **`git-notiql2.ts`** is an alternate build of the PR widget that adds a
+> Shortcut-driven "NEEDS REVIEW" category (open team PRs you haven't reviewed).
+> It's not wired into the default layout — point `RIGHT_TOP_CMD` at it in
+> `termdash` to use it instead. It needs `SHORTCUT_RO_TOKEN` plus the `TEAM_NAME`
+> / `TEAM_REPOS` constants set in the file; see its header for setup.
 
 ### Takeaways
 
@@ -131,6 +137,66 @@ links (iTerm2). Swap what runs where in the `CONFIG` block of `termdash`.
 3. **Two signals earn their keep** — "running" is process-based (not file-mtime); "waiting on you" comes from Cursor's SQLite (not the transcript).
 4. **Windows are the memory cost, not worktrees** — close idle ones (~0.5–1 GB each); one click reopens the exact worktree and restores its agent chat.
 5. **100% local, no Cursor API** — it reads files and processes you already have.
+
+</details>
+
+<details>
+<summary><h2>The <code>worktree</code> command</h2></summary>
+
+term-dash *observes* worktrees; [`worktree.zsh`](./worktree.zsh) is the companion
+that **creates and tears them down** — turning the raw `git worktree add`
+dance from the intro into one command that also provisions the new checkout and
+opens it in Cursor. It's plain zsh (relies on zsh-only features — don't run it
+with bash).
+
+### Install
+
+It *defines* functions, so source it from your `~/.zshrc` (it doesn't run on its
+own), then `source ~/.zshrc`:
+
+```sh
+source ~/Code/term-dash/worktree.zsh
+```
+
+Dependencies: `git` (required); `gh` (for `worktree clean`; optional for `rm`);
+the `cursor` CLI and `bundle`/`yarn` (optional — used only if present).
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `worktree -b <branch>` | Create a **new** branch off origin's default HEAD, in a sibling `<repo>-worktrees/<last-segment>` dir, provision it, `cd` in, and open it in a new Cursor window. |
+| `worktree <branch>` | Same, for an **existing** (local or remote) branch. |
+| `worktree rm` | Remove the worktree you're **standing in** — merged or not (type `delete` to confirm). Moves your shell back to the main checkout. |
+| `worktree clean [-y]` | Remove **all** worktrees whose GitHub PR has merged (uses `gh`, so squash-merges count). Skips dirty ones; `-y` skips the prompt. |
+
+Worktrees are created as a **sibling** dir (`popmenu` → `popmenu-worktrees/foo`),
+never nested inside the main checkout — a nested path confuses Cursor about which
+window owns a file, so diff/file links open in the wrong window.
+
+### What creation provisions
+
+A fresh worktree is missing everything gitignored, so `worktree -b` copies/links
+it in. All steps are guarded by existence checks — **they no-op outside the
+popmenu repo**:
+
+- symlinks `.husky/_` back to the main checkout (so the pre-commit hook works);
+- copies the gitignored `.env` / `.env.*` and `.bundle/config` over;
+- runs `bundle install` / `yarn install` if a `Gemfile` / `package.json` is present (non-fatal);
+- symlinks each `docs/plans/*` entry from the main checkout.
+
+### Teardown rolls back the shared dev DB (popmenu)
+
+Every worktree copies the same `.env`, so they all point at **one shared Postgres
+dev DB**. A migration you ran on a branch stays applied there after you leave it,
+and the next worktree's `db:*` tasks then re-annotate `app/models/**` +
+re-dump `db/schema.rb` against that drifted DB — the endless "salesforce models
+changed" noise. So `worktree rm` runs `rake migrate_branch_down` first (when the
+task exists), rolling back **only that branch's** migrations so the DB returns to
+master state and the next worktree opens clean. It's best-effort: a failed
+rollback warns but still removes the tree. `worktree clean` deliberately does
+*not* do this — merged branches' migrations belong to master and must stay
+applied.
 
 </details>
 
@@ -149,6 +215,7 @@ every tmux pane.
 | `tmux` | owns the pane layout | `brew install tmux` |
 | `node` (18+) | runs the widgets | `brew install node` |
 | `npx tsx` | executes the `.ts` widgets directly | comes with node; first run auto-installs `tsx` |
+| `gh` (authed) | `cursor-status.ts` reads PR/merged state via `gh`; also drives `worktree clean` | `brew install gh && gh auth login` |
 | iTerm2 | the widgets emit iTerm2-flavored OSC 8 clickable links | `brew install --cask iterm2` |
 
 Built and tested on macOS with iTerm2. Clickable links and `cursor://` /
@@ -160,10 +227,6 @@ Activity Monitor deep-links assume iTerm2.
 git clone <your-org>/term-dash.git ~/Code/term-dash
 cd ~/Code/term-dash
 ```
-
-> `Claude.dmg` (a ~330 MB binary) is currently checked in at the repo root and
-> is unrelated to the dashboard. Consider removing it / `.gitignore`-ing it
-> before publishing to save everyone the download.
 
 ### 3. Alias the launcher
 
@@ -181,10 +244,10 @@ break the rest of the dashboard.
 
 ```sh
 # ~/.zshrc
-export GITHUB_TOKEN="ghp_..."          # git-notiql, circleci-status
-export CIRCLECI_TOKEN="..."            # circleci-status
+export GITHUB_TOKEN="ghp_..."          # git-notiql
+export CIRCLECI_TOKEN="..."            # cursor-status (the ● CI dots in the worktrees panel)
 export NOTION_TOKEN="ntn_..."          # notion-todo
-export SHORTCUT_RO_TOKEN="..."         # git-notiql2 (NEEDS REVIEW category only)
+export NOTION_PAGE_ID="..."            # notion-todo (page to append to; 32-char id from its URL)
 ```
 
 After editing, `source ~/.zshrc` (or `termdash restart` from a fresh shell) so
@@ -194,12 +257,13 @@ the panes inherit the new values.
 
 | Env var | Used by | Where to get it | Scope needed |
 |---------|---------|-----------------|--------------|
-| `GITHUB_TOKEN` | `git-notiql.ts`, `git-notiql2.ts`, `circleci-status.ts` | GitHub → Settings → Developer settings → **Personal access tokens**. Classic is simplest. | `repo` (read private repos) + `read:user`. Authorize SSO for your org if it enforces SAML. |
-| `CIRCLECI_TOKEN` | `circleci-status.ts` | CircleCI → **User settings → Personal API Tokens**: <https://app.circleci.com/settings/user/tokens> | Personal API token (read is enough). |
+| `GITHUB_TOKEN` | `git-notiql.ts` | GitHub → Settings → Developer settings → **Personal access tokens**. Classic is simplest. | `repo` (read private repos) + `read:user`. Authorize SSO for your org if it enforces SAML. |
+| `CIRCLECI_TOKEN` | `cursor-status.ts` | CircleCI → **User settings → Personal API Tokens**: <https://app.circleci.com/settings/user/tokens> | Personal API token (read is enough). |
 | `NOTION_TOKEN` | `notion-todo.ts` | Notion → <https://www.notion.so/my-integrations> → **New integration** (internal). Copy the secret. Then **share the target page with the integration** (page → ••• → Connections), or it can't write. | Insert content on the shared page. |
-| `SHORTCUT_RO_TOKEN` | `git-notiql2.ts` | Shortcut → **Settings → API Tokens**: <https://app.shortcut.com/settings/account/api-tokens> | Read-only — only looks up which team owns a story. |
 
-`local-status.ts` and `cursor-status.ts` need **no tokens** — fully local.
+`local-status.ts` needs **no tokens**. `cursor-status.ts` needs `CIRCLECI_TOKEN`
+(for the ● CI dots) and an **authed `gh`** (for the ⎇/↥ PR + merged glyphs);
+everything else it reads — git worktrees, processes, Cursor's own files — is local.
 
 ### 5. Per-user config to change
 
@@ -208,10 +272,12 @@ your clone:
 
 | File | Setting | Current value | Change to |
 |------|---------|---------------|-----------|
-| `circleci-status.ts` | `PROJECT_SLUGS` | `["gh/Popmenu/popmenu"]` | Your CircleCI project slug(s), form `gh/<org>/<repo>`. |
-| `git-notiql2.ts` | `TEAM_REPOS` | `["Popmenu/popmenu"]` | Repo(s) to scan for team PRs needing review. |
-| `git-notiql2.ts` | `TEAM_NAME` | `"Marketeers"` | Your exact Shortcut team name. |
-| `notion-todo.ts` | `PAGE_ID` | `2df7e368-…` | The Notion page **you** want to-dos appended to (from its URL). |
+| `cursor-status.ts` | `REPOS` | dir→CircleCI-slug map incl. `gh/Popmenu/popmenu` | Your worktree repo dirs + their CircleCI slugs (`gh/<org>/<repo>`); use `null` for repos not on CircleCI. |
+| `cursor-status.ts` | `SC_SLUG` | `"popmenu"` | Your Shortcut workspace slug — drives the ◆ story links off `sc-<id>` branches. |
+| `cursor-status.ts` | `DEV_PORT` | `3000` | Port your dev server listens on — drives the ◂ "serving here" marker. |
+
+> `notion-todo.ts`'s target page is **not** hardcoded — set the `NOTION_PAGE_ID`
+> env var (step 4) to the Notion page **you** want to-dos appended to.
 
 > `git-notiql` derives **your** GitHub username automatically from `GITHUB_TOKEN`
 > (via `/user`) — there's no username to set.
@@ -236,9 +302,9 @@ the top of the [`termdash`](./termdash) launcher.
 - **GitHub 401/404 on private repos** — token needs `repo` scope and, for SAML
   orgs, SSO authorization (token page → "Configure SSO" → authorize).
 - **Notion write fails** — the integration hasn't been shared with the target
-  page, or `PAGE_ID` points at a page you don't own.
-- **`NEEDS REVIEW` empty in git-notiql2** — `SHORTCUT_RO_TOKEN` unset or
-  `TEAM_NAME` doesn't match your Shortcut team's exact name.
+  page, or `NOTION_PAGE_ID` points at a page you don't own.
+- **Worktrees panel shows gray dots / no PR glyph** — `CIRCLECI_TOKEN` unset (CI
+  dots) or `gh` not authenticated (`gh auth status`) for the PR/merged glyphs.
 - **Emoji/links render oddly** — the widgets target iTerm2; other terminals may
   mangle OSC 8 links and wide glyphs.
 
