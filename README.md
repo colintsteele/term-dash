@@ -56,6 +56,22 @@ WORKTREES + AGENTS                         (updated 3:14 PM, every 30s)
 
 Reading one row, left to right:
 - **`●` colored dot** — CI status for that branch: red failed · yellow running · green passed · gray unknown (cmd-click → the CircleCI workflow).
+- **`⎇` PR glyph** — cmd-click → the branch's PR. Magenta once the branch is on the
+  remote, **desaturated (dim magenta) while it isn't** — no `origin/<branch>`, so
+  there's no PR behind the link yet and the click just lands on an empty search.
+  Turns into a purple `↥` when the PR is merged (that row is `worktree clean`-able),
+  and is plain dim when the repo has no GitHub slug configured. The unpushed test is
+  `origin/<branch>` existing, *not* the branch's upstream — `worktree -b` branches
+  off `origin/master`, which git's default `branch.autoSetupMerge` records as their
+  upstream, so an upstream check would call every fresh worktree "pushed".
+- **`±` diff glyph** — always present. Cmd-click → that worktree's diff in [hubdiff](http://hubdiff.localhost/), the local diff viewer (`?repo=<url-encoded worktree path>`).
+
+With `TERMDASH_REUSE_TABS=1` and the small handler app from
+[`tab-reuse.md`](./tab-reuse.md), these links stop stacking up duplicate Chrome
+tabs: `±` reuses one hubdiff tab and repoints it per worktree, while the `◆`/`●`
+links — plus `⎇` and every badge in the `git-notiql` pane — focus the tab you
+already have open for that story / CI run / PR. Opt-in: without the handler the
+links behave as plain URLs.
 - **repo · branch** — from `git worktree list`. Cmd-click the name → opens/focuses that worktree's Cursor window (see below).
 - **agent glyph** — `▸ running · ✓ done · ‼ waiting on you · ✗ error · · none`.
 - **age** — how long since the agent's last activity.
@@ -116,8 +132,18 @@ term-dash is this worktree panel plus a few sibling widgets, tiled by the
    left, 15%            middle, 70%              right, 15%
 ```
 
-- **`git-notiql`** — GitHub PR radar: badges for replies on your own PRs, participating threads where you're waiting on a reply, and pending review requests. (Cmd-click a badge → the comment.)
-- **`local-status`** — CPU / memory / what's on port 3000.
+- **`git-notiql`** — GitHub PR radar: badges for replies on your own PRs, participating threads where you're waiting on a reply, and pending review requests. Also surfaces QA-app status on your own PRs from QA engineers' comments — 👷 while a "qa app deploy" environment is up, ✅ once "qa app destroy" signals it passed. (Cmd-click a badge → the comment.)
+- **`local-status`** — CPU / memory / what's on port 3000, e.g. `CPU 23%   MEM 74%   :3000 ruby 3.6G`.
+  That trailing figure is a rough RSS total for the dev server's **whole process
+  tree**, not the `:3000` listener alone — it's what catches the memory blowout after
+  a few branch swaps. Under a Procfile runner (popmenu's `bin/dev` is overmind) the
+  listener is only Rails at ~0.7 GB, while **rspack** — the bundler, on its own port,
+  and the thing that actually balloons — is a *sibling* process under the same
+  supervisor. Totalling just the listener would report a reassuring 0.7 GB while
+  rspack ate 4. Dim while healthy, then yellow / orange / red past `DEV_MEM_WARN_GB`
+  / `DEV_MEM_HIGH_GB` / `DEV_MEM_HOT_GB`. Shows MB below a gigabyte (a bare `node`
+  dev server reads `37M`). RSS counts pages shared between processes once per
+  process, so read it as a trend, not an exact figure.
 - **`notion-todo`** — type a to-do, Enter, it lands under this week's toggle in Notion.
 - **middle panes** — plain shells for actual work.
 
@@ -182,6 +208,12 @@ popmenu repo**:
 
 - symlinks `.husky/_` back to the main checkout (so the pre-commit hook works);
 - copies the gitignored `.env` / `.env.*` and `.bundle/config` over;
+- `nvm use`s the node version the repo pins — `.nvmrc`, `.node-version`, or
+  `.tool-versions` (popmenu: `24.14.0`), read from the worktree and falling back to
+  the main checkout, and `nvm install`ed if it's missing. This happens **before**
+  the installs, since `yarn install` builds native modules against the active node;
+  it also sticks in your shell after the `cd`. Needs nvm loaded in your shell (it's
+  a shell function, not a binary) — no nvm or no version file, and it's a no-op;
 - runs `bundle install` / `yarn install` if a `Gemfile` / `package.json` is present (non-fatal);
 - symlinks each `docs/plans/*` entry from the main checkout.
 
@@ -248,6 +280,11 @@ export GITHUB_TOKEN="ghp_..."          # git-notiql
 export CIRCLECI_TOKEN="..."            # cursor-status (the ● CI dots in the worktrees panel)
 export NOTION_TOKEN="ntn_..."          # notion-todo
 export NOTION_PAGE_ID="..."            # notion-todo (page to append to; 32-char id from its URL)
+
+# Optional: reuse Chrome tabs instead of opening a new one per click.
+# Needs the handler app from tab-reuse.md — inert without it, so leave unset
+# until you've installed it.
+export TERMDASH_REUSE_TABS=1
 ```
 
 After editing, `source ~/.zshrc` (or `termdash restart` from a fresh shell) so
@@ -275,6 +312,10 @@ your clone:
 | `cursor-status.ts` | `REPOS` | dir→CircleCI-slug map incl. `gh/Popmenu/popmenu` | Your worktree repo dirs + their CircleCI slugs (`gh/<org>/<repo>`); use `null` for repos not on CircleCI. |
 | `cursor-status.ts` | `SC_SLUG` | `"popmenu"` | Your Shortcut workspace slug — drives the ◆ story links off `sc-<id>` branches. |
 | `cursor-status.ts` | `DEV_PORT` | `3000` | Port your dev server listens on — drives the ◂ "serving here" marker. |
+| `cursor-status.ts` | `HUBDIFF_BASE` | `http://hubdiff.localhost/` | Base URL of your local diff viewer — drives the ± links. Point it at your own app, or drop the `diff` glyph from `render()` if you don't run one. |
+| `local-status.ts` | `PORT_TO_WATCH` | `3000` | Port your dev server listens on — drives the `:3000 <proc>` readout and its memory total. |
+| `local-status.ts` | `DEV_MEM_WARN_GB` / `DEV_MEM_HIGH_GB` / `DEV_MEM_HOT_GB` | `6` / `7` / `8` | Yellow / orange / red thresholds for the dev-stack memory total. **Whole-tree** totals — set them above your own idle baseline or every reading looks like a warning (popmenu idles ~3.5–4 GB). |
+| `local-status.ts` | `DEV_SUPERVISOR_RE` | `overmind\|foreman\|hivemind\|Procfile\|bin/dev` | How far up the process tree to climb from the port's listener before totalling. Add your Procfile runner if it isn't one of these; the memory figure will otherwise cover only the listener and its own children. |
 
 > `notion-todo.ts`'s target page is **not** hardcoded — set the `NOTION_PAGE_ID`
 > env var (step 4) to the Notion page **you** want to-dos appended to.

@@ -95,6 +95,13 @@ worktree() {
     cp -p "$root/.bundle/config" "$dir/.bundle/config"
   fi
 
+  # Pin node to the version this repo asks for (popmenu: 24.14.0) BEFORE any
+  # install runs — yarn install compiles native modules against whatever node is
+  # active, so installing under the wrong one silently poisons node_modules.
+  # Done here in the function body (not a subshell) so the version also sticks in
+  # your shell once we cd into the worktree below.
+  _worktree_node_version "$dir" "$root"
+
   # Install deps in the new tree. Non-fatal: a failed install still leaves a
   # usable checkout, and the error stays visible for you to rerun by hand.
   if [[ -f "$dir/Gemfile" ]] && command -v bundle >/dev/null; then
@@ -120,12 +127,82 @@ worktree() {
     echo "worktree: linked docs/plans from main checkout"
   fi
 
+  # Share the SQL scratch dir, same reasoning as docs/plans: the queries you run
+  # against the DB aren't per-branch, so ONE real copy lives in a sibling
+  # <repo>-sql/ dir (popmenu -> ~/Code/popmenu-sql, matching the <repo>-worktrees
+  # convention) and every worktree gets a symlink to it. Edit a query in any
+  # worktree and it's the same file everywhere — no copying between trees, and
+  # nothing stranded in a worktree you later delete.
+  #
+  # Symlink the DIR here rather than each file inside it (unlike docs/plans, which
+  # links entries individually to avoid orphaning a tracked .keep): nothing under
+  # sql/ is tracked, so there's no .keep to protect, and linking the dir itself
+  # means queries added later show up without re-running this.
+  #
+  # Kept out of git via .git/info/exclude (`/sql`) rather than .gitignore: that file
+  # lives in the shared common dir, so ONE line covers the main checkout and every
+  # linked worktree, and the repo's own .gitignore stays untouched.
+  #
+  # Guarded on the dir existing, so it no-ops for repos without one (term-dash etc.).
+  local sqldir="${root:h}/${root:t}-sql"
+  if [[ -d "$sqldir" ]]; then
+    ln -sfn "$sqldir" "$dir/sql"
+    echo "worktree: linked shared sql/ -> ${sqldir/#$HOME/~}"
+  fi
+
   cd "$dir"
   # Open the worktree in Cursor. Plain `cursor <folder>` opens a NEW window for a
   # folder that isn't already open (which every fresh worktree is) — and unlike
   # `cursor -n`, it reliably attaches the folder instead of racing to an empty
   # "select a project" window on cold start.
   command -v cursor >/dev/null && cursor "$dir"
+}
+
+# Switch nvm to the node version the repo pins, so the worktree's yarn install (and
+# your shell afterward) runs on the same node the main checkout does.
+#   _worktree_node_version <worktree-dir> <main-checkout-dir>
+# The version comes from the repo, never hardcoded: .nvmrc / .node-version /
+# .tool-versions, checked in the worktree first and falling back to the main
+# checkout (popmenu tracks .nvmrc, so a fresh worktree already has it — the
+# fallback covers repos that gitignore it). No version file, no nvm => no-op.
+#
+# nvm is a shell FUNCTION, not a binary, so `command -v nvm` is useless here and
+# this only works because worktree.zsh is sourced into an interactive shell that
+# already loaded nvm.sh. If nvm isn't loaded we stay silent and let the install run
+# on whatever node is active — same behavior as before this existed.
+_worktree_node_version() {
+  local dir="$1" fallback="$2" file ver
+
+  (( ${+functions[nvm]} )) || return 0
+
+  for file in "$dir"/.nvmrc "$dir"/.node-version "$fallback"/.nvmrc "$fallback"/.node-version; do
+    [[ -f "$file" ]] || continue
+    ver=$(<"$file")
+    break
+  done
+  # .tool-versions (asdf/mise) as a last resort: "nodejs 24.14.0" -> 24.14.0
+  if [[ -z "$ver" ]]; then
+    for file in "$dir"/.tool-versions "$fallback"/.tool-versions; do
+      [[ -f "$file" ]] || continue
+      # -E, not BRE: BSD/macOS sed has no \| alternation.
+      ver=$(sed -nE 's/^(nodejs|node)[[:space:]]+([^[:space:]]+).*/\2/p' "$file" | head -1)
+      [[ -n "$ver" ]] && break
+    done
+  fi
+
+  ver="${ver//[[:space:]]/}"   # strip the trailing newline (and any stray spaces)
+  [[ -n "$ver" ]] || return 0
+
+  # `nvm use` fails when that exact version isn't installed yet — install it rather
+  # than silently falling through to the default node. Non-fatal either way.
+  if ! nvm use "$ver" >/dev/null 2>&1; then
+    echo "worktree: node $ver (${file:t}) isn't installed — nvm install $ver…"
+    nvm install "$ver" >/dev/null 2>&1 || {
+      echo "worktree: nvm install $ver failed — continuing on node $(node -v 2>/dev/null)" >&2
+      return 1
+    }
+  fi
+  echo "worktree: node $(node -v) (pinned by ${file:t})"
 }
 
 # worktree clean — remove worktrees whose branch has a MERGED GitHub PR. Uses gh

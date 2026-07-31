@@ -5,7 +5,15 @@
  * that port is shared turf between Rails/puma and Create React App's dev
  * server — this reports what's really there instead of guessing).
  *
+ * The :3000 readout carries a rough memory total for that dev server — but for its
+ * WHOLE process tree, not the listener alone. Under a Procfile runner (overmind /
+ * foreman) the listener is just the Rails process; the bundler that actually leaks
+ * across a few branch swaps (rspack, on its own port) is a SIBLING under the same
+ * supervisor. Totalling only the listener would report a reassuring 0.7 GB while
+ * the bundler eats 4. See getDevStackRssKb.
+ *
  * Color thresholds (CPU/memory): dim <40%, yellow >=40%, orange >=60%, red >=80%.
+ * Dev-stack memory uses the same four tiers against DEV_MEM_*_GB.
  *
  * Command/ctrl-click CPU or MEM to launch Activity Monitor — its path is
  * resolved via Spotlight (mdfind) rather than hardcoded, since it moved
@@ -47,6 +55,23 @@ function colorForPercent(pct: number): string {
   if (pct >= 60) return ORANGE;
   if (pct >= 40) return YELLOW;
   return DIM;
+}
+
+// Dev-stack memory thresholds, in GB. These are WHOLE-TREE totals, not any single
+// process — set them above your own idle baseline or everything reads as a warning.
+// For reference, popmenu's `bin/dev` (puma + sidekiq + anycable + rpush + rspack +
+// node-renderer + graphql-codegen) idles around 3.5–4 GB; the blowout case is rspack
+// riding up against node's ~4 GB default heap ceiling, which drags the tree total
+// into the 7–8 GB range and is the point where restarting beats waiting for the OOM.
+const DEV_MEM_WARN_GB = 6;
+const DEV_MEM_HIGH_GB = 7;
+const DEV_MEM_HOT_GB = 8;
+
+function colorForDevMem(gb: number): string {
+  if (gb >= DEV_MEM_HOT_GB) return RED;
+  if (gb >= DEV_MEM_HIGH_GB) return ORANGE;
+  if (gb >= DEV_MEM_WARN_GB) return YELLOW;
+  return DIM; // healthy — stays quiet next to the port label
 }
 
 function sleep(ms: number): Promise<void> {
@@ -118,26 +143,127 @@ async function getMemoryPercent(): Promise<number | null> {
 
 // ---- Port check: who (if anyone) is listening on PORT_TO_WATCH ----
 
-async function getPortProcess(port: number): Promise<string | null> {
+// The PID comes back alongside the command name because it's the foothold
+// getDevStackRssKb needs in the process tree.
+async function getPortProcess(port: number): Promise<{ command: string; pid: number } | null> {
   try {
     const { stdout } = await execAsync(`lsof -nP -iTCP:${port} -sTCP:LISTEN`);
     const lines = stdout.trim().split("\n");
     if (lines.length < 2) return null; // just the header, or empty
-    const command = lines[1].split(/\s+/)[0];
-    return command || null;
+    const [command, pidStr] = lines[1].split(/\s+/);
+    const pid = parseInt(pidStr, 10);
+    if (!command || Number.isNaN(pid)) return null;
+    return { command, pid };
   } catch {
     return null; // lsof exits non-zero when nothing matches, or isn't installed
   }
 }
 
-function describePort(command: string | null): string {
-  if (!command) return `${DIM}:${PORT_TO_WATCH} —${RESET}`;
-  const color = /ruby|puma|rails/i.test(command)
+// ---- Dev-server memory: the listener's whole process tree ----
+
+interface Proc {
+  pid: number;
+  ppid: number;
+  rssKb: number; // resident set size, KB (what `ps` reports on macOS)
+  command: string;
+}
+
+async function getProcTable(): Promise<Proc[]> {
+  try {
+    // maxBuffer well above the ~100 KB a few hundred processes produce, since some
+    // command lines (Electron apps, in particular) are enormous.
+    const { stdout } = await execAsync("ps -axo pid,ppid,rss,command", { maxBuffer: 8 * 1024 * 1024 });
+    const procs: Proc[] = [];
+    for (const line of stdout.split("\n").slice(1)) {
+      // "  PID  PPID   RSS COMMAND" — the command is last and contains spaces, so
+      // it takes everything after the three numeric columns.
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/);
+      if (m) procs.push({ pid: +m[1], ppid: +m[2], rssKb: +m[3], command: m[4] });
+    }
+    return procs;
+  } catch {
+    return [];
+  }
+}
+
+// A process supervisor: if the port's listener has one of these as an ancestor, the
+// whole dev stack hangs off it and that's what we want to total. popmenu's `bin/dev`
+// is overmind, which runs each Procfile entry as an `sh` under a per-worktree
+// `tmux -C -L overmind-<name>` — both carry "overmind" in argv, so one pattern
+// catches the chain.
+const DEV_SUPERVISOR_RE = /overmind|foreman|hivemind|Procfile|bin\/dev/;
+
+// Rough RSS total, in KB, for the dev server rooted at the port's listener.
+//
+// Walk UP from the listener while the parent still looks like a supervisor, then sum
+// the whole subtree under the highest one found. Bounding the climb by
+// DEV_SUPERVISOR_RE is what keeps this honest: with a bare `rails s` in an editor
+// terminal the parent is a shell, no match, so the root stays the server itself and
+// we total it plus its cluster workers. Climbing blindly to the topmost ancestor
+// would instead root at the editor's helper process and bill the whole IDE to the
+// dev server. (Matching on directory or project name has the same failure — an
+// editor's per-project processes carry that name too.)
+//
+// "Rough" is load-bearing: RSS counts pages shared between processes (the ~40 MB
+// node binary, mapped once per process) once per process, so a 29-process tree
+// overstates somewhat. Read it as a trend — "time to restart?" — not a true figure.
+function getDevStackRssKb(listenerPid: number, procs: Proc[]): number | null {
+  const byPid = new Map(procs.map((p) => [p.pid, p]));
+  if (!byPid.has(listenerPid)) return null;
+
+  let root = listenerPid;
+  // Cap the climb: cheap insurance against a pathological/looping ppid chain.
+  for (let i = 0; i < 8; i++) {
+    const parent = byPid.get(byPid.get(root)!.ppid);
+    if (!parent || parent.pid <= 1 || !DEV_SUPERVISOR_RE.test(parent.command)) break;
+    root = parent.pid;
+  }
+
+  const kids = new Map<number, number[]>();
+  for (const p of procs) {
+    if (p.pid === p.ppid) continue; // self-parenting would loop the walk below
+    const list = kids.get(p.ppid);
+    if (list) list.push(p.pid);
+    else kids.set(p.ppid, [p.pid]);
+  }
+
+  let total = 0;
+  const seen = new Set<number>();
+  const stack = [root];
+  while (stack.length) {
+    const pid = stack.pop()!;
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    total += byPid.get(pid)?.rssKb ?? 0;
+    for (const k of kids.get(pid) ?? []) stack.push(k);
+  }
+  return total;
+}
+
+// One decimal under 10 GB, none above — a rough number shouldn't imply precision it
+// doesn't have, and this keeps the label to 3–4 chars at any scale. Below 1 GB it
+// switches to MB: a bare `node` dev server is tens of megabytes, and "37M" says that
+// where "0.0G" just looks broken.
+function formatMem(kb: number): string {
+  const gb = kb / 1048576;
+  if (gb < 1) return `${Math.round(kb / 1024)}M`;
+  return `${gb >= 10 ? gb.toFixed(0) : gb.toFixed(1)}G`;
+}
+
+function describePort(port: { command: string; pid: number } | null, devMemKb: number | null): string {
+  if (!port) return `${DIM}:${PORT_TO_WATCH} —${RESET}`;
+  const color = /ruby|puma|rails/i.test(port.command)
     ? GREEN
-    : /node/i.test(command)
+    : /node/i.test(port.command)
       ? CYAN
       : YELLOW;
-  return `${color}:${PORT_TO_WATCH} ${command}${RESET}`;
+  // Memory rides just after the process name. Omitted (not zeroed) when the tree
+  // couldn't be read, so a failed `ps` costs the line nothing but the number.
+  const mem =
+    devMemKb !== null
+      ? ` ${colorForDevMem(devMemKb / 1048576)}${formatMem(devMemKb)}${RESET}`
+      : "";
+  return `${color}:${PORT_TO_WATCH} ${port.command}${RESET}${mem}`;
 }
 
 // ---- Activity Monitor location, resolved once via Spotlight (not hardcoded —
@@ -168,7 +294,8 @@ async function getActivityMonitorUrl(): Promise<string | null> {
 function render(
   cpuPct: number,
   memPct: number | null,
-  portCommand: string | null,
+  portProcess: { command: string; pid: number } | null,
+  devMemKb: number | null,
   activityMonitorUrl: string | null
 ): void {
   process.stdout.write("\x1b[3J\x1b[2J\x1b[H"); // clear scrollback + screen + home, not a full reset (\x1Bc)
@@ -181,20 +308,25 @@ function render(
   if (activityMonitorUrl) memLabel = link(memLabel, activityMonitorUrl);
   const memStr = memPct !== null ? `${colorForPercent(memPct)}${memLabel}${RESET}` : `${DIM}${memLabel}${RESET}`;
 
-  const portStr = describePort(portCommand);
+  const portStr = describePort(portProcess, devMemKb);
 
   console.log(`${cpuStr}   ${memStr}   ${portStr}`);
 }
 
 async function loop(): Promise<void> {
   try {
-    const [cpuPct, memPct, portCommand, activityMonitorUrl] = await Promise.all([
+    // The process table is fetched in parallel with the port lookup rather than
+    // after it: they're independent reads, and the tree walk that joins them is
+    // pure in-memory work once both have landed.
+    const [cpuPct, memPct, portProcess, procs, activityMonitorUrl] = await Promise.all([
       getCpuPercent(),
       getMemoryPercent(),
       getPortProcess(PORT_TO_WATCH),
+      getProcTable(),
       getActivityMonitorUrl(),
     ]);
-    render(cpuPct, memPct, portCommand, activityMonitorUrl);
+    const devMemKb = portProcess ? getDevStackRssKb(portProcess.pid, procs) : null;
+    render(cpuPct, memPct, portProcess, devMemKb, activityMonitorUrl);
   } catch (err) {
     process.stdout.write("\x1b[3J\x1b[2J\x1b[H");
     console.log(`⚠️  ${(err as Error).message}`);
@@ -205,7 +337,15 @@ async function loop(): Promise<void> {
 // ---- entry point ----
 
 if (process.argv.includes("--mock")) {
-  render(42, 67, "puma", "file:///Applications/Utilities/Activity%20Monitor.app");
+  // 6.6 GB lands in the yellow tier, so --mock exercises the memory colouring
+  // rather than showing the dim healthy case.
+  render(
+    42,
+    67,
+    { command: "puma", pid: 1234 },
+    6_920_000,
+    "file:///Applications/Utilities/Activity%20Monitor.app"
+  );
 } else {
   process.stdout.write(HIDE_CURSOR);
   process.on("exit", () => process.stdout.write(SHOW_CURSOR));

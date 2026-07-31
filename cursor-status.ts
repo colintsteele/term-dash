@@ -8,15 +8,26 @@
  *   2. Git/PR                 → the ⎇ glyph between the dot and the branch name.
  *        cmd/ctrl-click it → the branch's GitHub PR (dim if the repo has no
  *        GitHub slug configured). Turns into a purple ↥ when the PR is MERGED —
- *        i.e. this worktree is ready to reap with `worktree clean`.
+ *        i.e. this worktree is ready to reap with `worktree clean`. Desaturated
+ *        (dim magenta) while the branch has no `origin/<branch>` yet: nothing is
+ *        pushed, so there cannot be a PR behind the link.
  *   2b. Shortcut ticket       → a cyan ◆ right after the ⎇, shown when the branch
  *        has an sc-<id>. cmd/ctrl-click → the Shortcut story (app.shortcut.com).
+ *   2c. hubdiff               → a white ± right after the ◆, on every row.
+ *        cmd/ctrl-click → this worktree's diff in the local hubdiff app
+ *        (http://hubdiff.localhost/?repo=<url-encoded worktree path>).
  *   3. Cursor agent state     → the trailing glyph after the branch name.
  *        (anim) running · ✓ done · !! waiting on you (a question) · ✗ error ·
  *        (dim) no agent.  cmd/ctrl-click the NAME → focuses that Cursor window.
  *   4. Dev server             → a blue ◂ right after the branch name marks the
  *        worktree whose directory is serving localhost:DEV_PORT (found by
  *        matching the listening process's cwd to the worktree path).
+ *   5. The repo's MAIN checkout (popmenu's master) gets a row too, pinned FIRST and
+ *        deliberately bare: CI dot, name, and the agent/dev markers only. No ⎇/◆/±,
+ *        no approvals, no failing-job indents — master isn't a unit of work, it has
+ *        no PR or story, and its diff is the baseline the other rows diff against.
+ *        It's there to cmd-click into that repo's Cursor window. Only rendered for
+ *        repos that actually have linked worktrees. See `isMain`.
  *
  * This widget REPLACES the standalone circleci panel: CI is now folded in
  * here, keyed to the worktrees you actually have open, so there's no need to
@@ -86,10 +97,6 @@ const CI_REFRESH_SECONDS = 30; // CI is a network read — poll it slow, render 
 const ANIM_INTERVAL_MS = 500; // running-glyph animation frame; ~2s per full sweep over RUN_TRACK slots
 const MAX_ROWS = 12;
 const RUNNING_WINDOW_MS = 20_000; // transcript touched this recently + turn open = running (fallback)
-const AGENTS_PER_WORKTREE = 2; // how many recent sessions to consider per worktree
-
-// Default-branch checkouts aren't interesting agent worktrees — skip them.
-const EXCLUDE_BRANCHES = new Set(["master", "main"]);
 
 const CIRCLECI_TOKEN = process.env.CIRCLECI_TOKEN;
 const CIRCLECI_API = "https://circleci.com/api/v2";
@@ -106,12 +113,36 @@ const CYAN = "\x1b[36m";
 const GRAY = "\x1b[90m";
 const MAGENTA = "\x1b[35m";
 const PURPLE = "\x1b[38;2;137;87;224m"; // GitHub "merged" hue — distinguishes merged from open-PR magenta
+// Unpushed-branch ⎇: same hue as the open-PR glyph, muted by the terminal's own dim
+// attribute rather than a hardcoded RGB, so it tracks MAGENTA if that ever changes
+// and stays readable on any background. Distinct from bare DIM (no-GitHub-slug),
+// which keeps the default foreground.
+const DIM_MAGENTA = DIM + MAGENTA;
 const WHITE = "\x1b[97m";
 const HIDE_CURSOR = "\x1b[?25l";
 const SHOW_CURSOR = "\x1b[?25h";
 
 function link(text: string, url: string): string {
   return `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`;
+}
+
+// Every http link in this panel goes through webLink, which optionally routes it
+// through the `termdash:` scheme so a cmd-click REUSES the Chrome tab you already
+// have open for that PR / story / workflow / diff instead of stacking duplicates.
+// An OSC 8 sequence carries only a URI — there's no "reuse a tab" flag — so the
+// redirect through a scheme we own (handled by TermDashOpen.app → tab-open.sh) is
+// the only place that intent can live. See tab-reuse.md for the install.
+//
+// The payload is percent-encoded because the inner URL has its own ? and #: nested
+// raw, NSURL reads them as the OUTER url's query/fragment and mangles the link.
+//
+// OFF unless TERMDASH_REUSE_TABS=1, because a `termdash:` link is inert on a
+// machine without the handler installed — anyone else cloning this repo gets plain
+// URLs and today's new-tab behavior.
+const REUSE_TABS = process.env.TERMDASH_REUSE_TABS === "1";
+
+function webLink(text: string, url: string): string {
+  return link(text, REUSE_TABS ? `termdash:${encodeURIComponent(url)}` : url);
 }
 
 // ── agent state ────────────────────────────────────────────────────────────
@@ -169,11 +200,14 @@ interface Worktree {
   repo: string; // label (basename of the repo we scanned)
   wtPath: string; // absolute worktree path
   branch: string;
-  agents: Agent[];
+  agent?: Agent; // the worktree's most recently touched agent session (see newestAgentFor)
+  isMain: boolean; // the repo's main checkout (master), not a linked worktree — bare row, see render()
+  scTier?: ScTier; // Shortcut story pipeline tier, drives the ◆ colour (undefined = unknown/no token)
   mtime: number; // most-recent agent activity (0 if none)
   agentState: AgentState; // rolled-up agent badge
   ci: Ci;
   prUrl?: string; // GitHub PR for this branch (undefined = repo has no GitHub slug)
+  pushed: boolean; // `origin/<branch>` exists locally → the branch is on the remote, so a PR is possible
   approvals: number; // # of APPROVED reviews on that PR (0 if none / no PR / not resolved yet)
   merged: boolean; // the branch's most recent PR is MERGED → worktree is `worktree clean`-able
   devRunning: boolean; // a process serving DEV_PORT has its cwd inside this worktree
@@ -225,6 +259,65 @@ function resolvePr(slug: string, branch: string): { url: string | null; approval
 }
 
 // ---- git worktrees ----
+
+// Which of `branches` have been pushed, i.e. have a local `refs/remotes/origin/<b>`.
+// This is the gate on "can a PR even exist", and it's what desaturates the ⎇ glyph.
+//
+// NOT `@{u}`/branch.upstream: `worktree -b foo` branches off origin/master, and with
+// git's default branch.autoSetupMerge that sets foo's upstream to *origin/master*.
+// So a never-pushed branch HAS an upstream, and @{u} would report the row as pushed
+// on exactly the branches we want dimmed. The remote-tracking ref for the branch
+// itself is the honest signal.
+//
+// One git call per repo, not per branch: passing the refs as explicit patterns keeps
+// the output to the handful we asked about instead of enumerating every remote ref
+// (~30ms vs ~110ms on a repo with 4k+ branches). Patterns also match one level down
+// (`…/origin/a/b` matches pattern `…/origin/a`), so we compare the RETURNED names
+// exactly rather than trusting "the pattern matched something".
+//
+// Freshness: `git push` writes refs/remotes/origin/<branch> in the repo you pushed
+// from, so a push anywhere in this repo shows up here on the next 5s tick with no
+// fetch. Pushing from a DIFFERENT clone stays dim until something fetches.
+//
+// Returns null when we can't tell (git failed, or the repo has no origin refs at
+// all) so callers can fail open and leave the glyph at full saturation — better a
+// missed dim than every row in a remote-less repo washed out.
+function pushedBranches(repo: string, branches: string[]): Set<string> | null {
+  if (branches.length === 0) return null;
+  let out: string;
+  try {
+    out = execFileSync(
+      "git",
+      ["-C", repo, "for-each-ref", "--format=%(refname:lstrip=3)",
+       ...branches.map((b) => `refs/remotes/origin/${b}`)],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
+    );
+  } catch {
+    return null; // not a repo / git missing
+  }
+  const names = out.split("\n").map((l) => l.trim()).filter(Boolean);
+  // No origin refs matched AND the repo has no origin at all → "can't tell". A repo
+  // WITH an origin that simply matched nothing is a real all-unpushed answer, so
+  // only the missing-remote case fails open.
+  if (names.length === 0 && !hasOrigin(repo)) return null;
+  return new Set(names);
+}
+
+// Does this repo have any `origin` remote-tracking refs? Only consulted to
+// disambiguate an empty pushedBranches() result, so it costs nothing in the
+// common case. `--count` keeps it O(1) output regardless of branch count.
+function hasOrigin(repo: string): boolean {
+  try {
+    const n = execFileSync(
+      "git",
+      ["-C", repo, "for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes/origin"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
+    ).trim();
+    return n.length > 0;
+  } catch {
+    return false;
+  }
+}
 
 function listWorktrees(repo: string): { wtPath: string; branch: string }[] {
   let out: string;
@@ -415,42 +508,48 @@ function readAgent(sessionDir: string, uuid: string): Agent | null {
   return { uuid, mtime, state, closed, note, title: firstUserQuery(lines) };
 }
 
-function agentsFor(wtPath: string): Agent[] {
+// The single most recently touched agent session for a worktree, or undefined if
+// there are none. One row shows one agent: a worktree can accumulate many sessions
+// over its life, and rolling several into one row meant a "×2" counter and a badge
+// that mixed states from different runs. The newest session is the one you care
+// about — it's what you were last doing there.
+function newestAgentFor(wtPath: string): Agent | undefined {
   const dir = path.join(HOME, ".cursor", "projects", encodeProject(wtPath), "agent-transcripts");
   let entries: string[];
   try {
     entries = fs.readdirSync(dir);
   } catch {
-    return []; // no agent sessions for this worktree
+    return undefined; // no agent sessions for this worktree
   }
-  const agents: Agent[] = [];
+  let newest: Agent | undefined;
   for (const uuid of entries) {
     const a = readAgent(path.join(dir, uuid), uuid);
-    if (a) agents.push(a);
+    if (a && (!newest || a.mtime > newest.mtime)) newest = a;
   }
-  agents.sort((a, b) => b.mtime - a.mtime);
-  return agents.slice(0, AGENTS_PER_WORKTREE);
+  return newest;
 }
 
-// Roll a worktree's agents up to one badge, using the live-process signal.
-// error > running > done > none. "running" needs a live agent-exec process (or
-// a very recently touched transcript) whose latest turn hasn't closed out.
+// The badge for a worktree's newest agent session, using the live-process signal.
+// "running" needs a live agent-exec process (or a very recently touched transcript)
+// whose latest turn hasn't closed out.
+//
+// Deliberately reads ONLY the newest session. The previous version OR'd states
+// across the two most recent sessions, which meant an old failed run pinned the row
+// to ✗ forever — `agents.some(a => a.state === "error")` was checked first, so a
+// later clean run couldn't clear it. Newest-only means the badge tracks what you
+// last did in that worktree and settles as soon as that run does.
 //
 // "waiting" (blocked on your answer to an AskQuestion) is deliberately NOT
 // decided here: a pending question is indistinguishable from "running" by the
 // transcript alone (see the header note). gather() overlays "waiting" on top of
-// a "running" rollup when pendingQuestion() confirms it from Cursor's own state.
-function rollupAgent(agents: Agent[], live: boolean): AgentState {
-  if (agents.some((a) => a.state === "error")) return "error";
-  if (agents.length === 0) return live ? "running" : "none"; // process up, transcript not written yet
-  // "running" = a turn that never closed out (no terminal turn_ended), backed by
-  // a live agent-exec process for this worktree — or, failing that, a transcript
-  // touched in the last few seconds. Checking ANY considered session (not just
-  // the newest by mtime) catches a running agent whose own transcript went stale
-  // while a sibling session in the same worktree finished more recently.
-  const openTurn = agents.some((a) => !a.closed);
-  const recentOpen = agents.some((a) => !a.closed && Date.now() - a.mtime < RUNNING_WINDOW_MS);
-  if (openTurn && (live || recentOpen)) return "running";
+// a "running" state when pendingQuestion() confirms it from Cursor's own state.
+function agentBadge(agent: Agent | undefined, live: boolean): AgentState {
+  if (!agent) return live ? "running" : "none"; // process up, transcript not written yet
+  if (agent.state === "error") return "error";
+  // "running" = a turn that never closed out (no terminal turn_ended), backed by a
+  // live agent-exec process for this worktree — or, failing that, a transcript
+  // touched in the last few seconds.
+  if (!agent.closed && (live || Date.now() - agent.mtime < RUNNING_WINDOW_MS)) return "running";
   return "done";
 }
 
@@ -518,6 +617,67 @@ function pendingQuestion(uuid: string): boolean {
   } catch {
     return false;
   }
+}
+
+// ---- Shortcut (story workflow state → ◆ colour) ----
+
+// Read-only token, same one already exported in ~/.zsh-sources/exports.zsh. Without
+// it the ◆ just stays neutral — the glyph and its link work regardless, exactly like
+// CI dots staying gray without CIRCLECI_TOKEN.
+const SHORTCUT_TOKEN = process.env.SHORTCUT_RO_TOKEN;
+const SHORTCUT_API = "https://api.app.shortcut.com/api/v3";
+
+// Where a story sits in the pipeline, collapsed to the handful of distinctions worth
+// a colour. Deliberately coarser than Shortcut's 11 Delivery states: the question
+// this glyph answers at a glance is "is this mine to push on, waiting on QA, or
+// ready to ship".
+type ScTier = "idle" | "active" | "qa" | "ship" | "done";
+
+async function sc<T>(p: string): Promise<T> {
+  const res = await fetch(`${SHORTCUT_API}${p}`, {
+    headers: { "Shortcut-Token": SHORTCUT_TOKEN as string },
+  });
+  if (!res.ok) throw new Error(`${p} -> ${res.status}`);
+  return res.json() as Promise<T>;
+}
+
+// Bucket a workflow state. Matched on NAME first, then falling back to Shortcut's
+// coarse `type`, because type alone can't answer this: "In Development",
+// "Ready for QA", "In QA", "Ready for Merge" and "Ready for Deploy" are ALL
+// type=started in the Delivery workflow, so type alone would collapse the whole
+// middle of the pipeline into one colour.
+//
+// Name matching (not position) so it works across the Delivery / Discovery / Data
+// workflows, which have different state counts and orderings — position 7 is
+// "Ready for Merge" in Delivery but "Ready for Review" in Data.
+//
+// Order matters: the ship and QA names are checked before the type fallbacks,
+// since they're type=started too.
+function scTier(name: string, type: string): ScTier {
+  const n = name.trim().toLowerCase();
+  if (/ready for (merge|deploy|approval)/.test(n)) return "ship";
+  if (/\bqa\b/.test(n)) return "qa";
+  if (type === "done") return "done";
+  if (type === "backlog" || type === "unstarted") return "idle";
+  return "active";
+}
+
+// workflow-state id → tier, for every workflow in the workspace. Fetched once per
+// process: states are workspace configuration and effectively never change while the
+// widget is running, so re-fetching them on every slow tick would be pure waste.
+let scStateTiers: Map<number, ScTier> | null = null;
+
+interface ScWorkflow {
+  states: { id: number; name: string; type: string }[];
+}
+
+async function loadScStateTiers(): Promise<Map<number, ScTier>> {
+  const workflows = await sc<ScWorkflow[]>("/workflows");
+  const map = new Map<number, ScTier>();
+  for (const w of workflows) {
+    for (const s of w.states) map.set(s.id, scTier(s.name, s.type));
+  }
+  return map;
 }
 
 // ---- CircleCI ----
@@ -634,6 +794,7 @@ const ciCache = new Map<string, Ci>();
 const prCache = new Map<string, string>(); // slug+branch → direct PR url (from gh)
 const approvalsCache = new Map<string, number>(); // slug+branch → # APPROVED reviews (from gh)
 const mergedCache = new Map<string, boolean>(); // slug+branch → most-recent PR is MERGED (from gh)
+const scTierCache = new Map<string, ScTier>(); // shortcut story id → pipeline tier (from the Shortcut API)
 let slowFetchedAt = 0;
 let slowInFlight = false;
 
@@ -651,16 +812,20 @@ async function refreshSlow(): Promise<void> {
   try {
     for (const repo of REPOS) {
       if (!repo.slug) continue;
-      const branches = new Set(
-        listWorktrees(repo.dir)
-          .map((w) => w.branch)
-          .filter((b) => !EXCLUDE_BRANCHES.has(b))
-      );
+      const wts = listWorktrees(repo.dir);
+      // CI covers every branch INCLUDING the main checkout's — the ● dot is the one
+      // signal the master row does carry.
+      const branches = new Set(wts.map((w) => w.branch));
       if (CIRCLECI_TOKEN) {
         const map = await ciForRepo(repo.slug, branches);
         for (const [branch, ci] of map) ciCache.set(ciKey(repo.slug, branch), ci);
       }
+      // PR resolution does NOT: master has no PR, so `gh pr list --head master`
+      // is a guaranteed-empty network call on every slow tick. `git worktree list`
+      // puts the main checkout first, so wts[0] identifies the branch to skip.
+      const mainBranch = wts[0]?.branch;
       for (const branch of branches) {
+        if (branch === mainBranch) continue;
         const { url, approvals, merged } = resolvePr(repo.slug, branch);
         // Only cache on a resolved PR, so a transient gh failure (url:null,
         // approvals:0) never clobbers a previously-known URL, approval count, or
@@ -672,9 +837,52 @@ async function refreshSlow(): Promise<void> {
         }
       }
     }
+    await refreshShortcut();
     slowFetchedAt = Date.now();
   } finally {
     slowInFlight = false;
+  }
+}
+
+// Pull each sc-<id> branch's workflow state into scTierCache. Runs across ALL repos,
+// not just the CircleCI-configured ones, because the story id comes from the branch
+// name and has nothing to do with a repo's CI slug.
+//
+// One request per distinct story per slow tick, and only for branches that actually
+// carry an sc- id — with a handful of worktrees that's a few requests per 30s. The
+// workflow-state table is fetched once per process on top of that (see
+// scStateTiers).
+//
+// Errors are swallowed per story and the previous cached tier is left alone, so a
+// blip leaves the ◆ showing its last known colour instead of flickering to neutral.
+async function refreshShortcut(): Promise<void> {
+  if (!SHORTCUT_TOKEN) return;
+
+  const ids = new Set<string>();
+  for (const repo of REPOS) {
+    for (const { branch } of listWorktrees(repo.dir)) {
+      const id = shortcutId(branch);
+      if (id) ids.add(id);
+    }
+  }
+  if (ids.size === 0) return;
+
+  if (!scStateTiers) {
+    try {
+      scStateTiers = await loadScStateTiers();
+    } catch {
+      return; // no state table → can't map anything; try again next tick
+    }
+  }
+
+  for (const id of ids) {
+    try {
+      const story = await sc<{ workflow_state_id: number }>(`/stories/${id}`);
+      const tier = scStateTiers.get(story.workflow_state_id);
+      if (tier) scTierCache.set(id, tier);
+    } catch {
+      /* leave the previous tier in place */
+    }
   }
 }
 
@@ -689,23 +897,35 @@ function gather(): Worktree[] {
     const wts = listWorktrees(repo.dir);
     if (wts.length === 0) continue;
 
-    for (const { wtPath, branch } of wts) {
-      if (EXCLUDE_BRANCHES.has(branch)) continue; // skip the default-branch checkout
-      const agents = agentsFor(wtPath);
+    // One lookup for every branch in this repo (see pushedBranches). null = couldn't
+    // tell, in which case every row stays fully saturated.
+    const pushed = pushedBranches(repo.dir, wts.map((w) => w.branch));
+
+    // `git worktree list` always puts the MAIN working tree first (the same
+    // guarantee worktree.zsh's clean/rm rely on), so index 0 identifies it without
+    // having to guess at branch names — a linked worktree that happens to sit on
+    // master is still a real worktree and keeps its full row.
+    for (const [i, { wtPath, branch }] of wts.entries()) {
+      const isMain = i === 0;
+      // A repo with no linked worktrees (popship, term-dash) shouldn't spend a row
+      // on its master — there'd be nothing for that row to sit alongside.
+      if (isMain && wts.length === 1) continue;
+      const agent = newestAgentFor(wtPath);
       // Base state from the transcript, then overlay "waiting" when Cursor's DB
-      // shows a live unanswered question. Only worth the DB read when the rollup
+      // shows a live unanswered question. Only worth the DB read when the badge
       // is "running" (open turn + live process) — the one state a pending
       // question can hide inside; done/error/none can't be waiting-on-you.
-      let agentState = rollupAgent(agents, live.has(path.basename(wtPath)));
-      if (agentState === "running" && agents.some((a) => pendingQuestion(a.uuid))) {
+      let agentState = agentBadge(agent, live.has(path.basename(wtPath)));
+      if (agentState === "running" && agent && pendingQuestion(agent.uuid)) {
         agentState = "waiting";
       }
       worktrees.push({
         repo: repoLabel,
         wtPath,
         branch,
-        agents,
-        mtime: agents[0]?.mtime ?? 0,
+        agent,
+        isMain,
+        mtime: agent?.mtime ?? 0,
         agentState,
         ci: repo.slug ? ciCache.get(ciKey(repo.slug, branch)) ?? { status: "unknown" } : { status: "unknown" },
         // direct PR link (gh-resolved) when we have it; otherwise the head-ref
@@ -713,6 +933,8 @@ function gather(): Worktree[] {
         prUrl: repo.slug
           ? prCache.get(ciKey(repo.slug, branch)) ?? prSearchUrl(repo.slug, branch)
           : undefined,
+        pushed: pushed ? pushed.has(branch) : true, // null (unknown) → don't desaturate
+        scTier: (() => { const id = shortcutId(branch); return id ? scTierCache.get(id) : undefined; })(),
         approvals: repo.slug ? approvalsCache.get(ciKey(repo.slug, branch)) ?? 0 : 0,
         merged: repo.slug ? mergedCache.get(ciKey(repo.slug, branch)) ?? false : false,
         devRunning: false, // resolved below, once all worktrees are known
@@ -734,9 +956,18 @@ function gather(): Worktree[] {
     if (best) best.devRunning = true;
   }
 
-  // newest agent activity first; worktrees with no agents sink to the bottom
-  worktrees.sort((a, b) => b.mtime - a.mtime);
-  return worktrees.slice(0, MAX_ROWS);
+  // Main-checkout rows are pinned to the TOP, always, and are exempt from MAX_ROWS.
+  // Pinned rather than sorted because it's a fixed handle for grabbing that repo's
+  // window: it should be in the same place every time you look, not wherever its
+  // agent activity happens to put it (popmenu's main checkout has hundreds of
+  // sessions, so mtime ordering would shuffle it around), and it should never be
+  // truncated away when you have a lot of worktrees open.
+  // Below it, linked worktrees keep the old ordering: newest agent activity first,
+  // worktrees with no agents sinking to the bottom.
+  const main = worktrees.filter((w) => w.isMain);
+  const linked = worktrees.filter((w) => !w.isMain);
+  linked.sort((a, b) => b.mtime - a.mtime);
+  return [...main, ...linked.slice(0, MAX_ROWS)];
 }
 
 // ---- render ----
@@ -768,24 +999,76 @@ const DEV_GLYPH = "◂";
 // stop at the next `/` (so steele/sc-170267/foo → 170267). cmd/ctrl-click →
 // the Shortcut story. `◆` is single-width and plain-font-safe. The story URL is
 // built from the branch alone (no token, no network), so it costs just a regex.
+//
+// Its COLOUR is the story's pipeline position, filled in on the slow lane (see
+// refreshShortcut). Without SHORTCUT_RO_TOKEN, or before the first fetch lands, the
+// glyph stays neutral cyan and still links — the colour is an enhancement, never a
+// prerequisite.
 const SC_GLYPH = "◆";
 const SC_SLUG = "popmenu"; // app.shortcut.com/<SC_SLUG>/story/<id>
 
-function shortcutUrl(branch: string): string | undefined {
+function shortcutId(branch: string): string | undefined {
   const m = branch.match(/sc-(\d+)/i);
-  return m ? `https://app.shortcut.com/${SC_SLUG}/story/${m[1]}` : undefined;
+  return m ? m[1] : undefined;
 }
 
-function gitGlyph(prUrl: string | undefined, merged: boolean): string {
+function shortcutUrl(branch: string): string | undefined {
+  const id = shortcutId(branch);
+  return id ? `https://app.shortcut.com/${SC_SLUG}/story/${id}` : undefined;
+}
+
+// ◆ colour by pipeline tier:
+//   idle   dim     — backlog / planned / ready for dev: not being worked yet
+//   active cyan    — in development / ready for review: yours to push on (the
+//                    original colour, so the common case looks unchanged)
+//   qa     yellow  — ready for QA / in QA: waiting on someone else
+//   ship   green   — ready for merge / deploy / approval: go
+//   done   purple  — completed, reusing the same hue as the merged-PR ↥
+function scColor(tier: ScTier | undefined): string {
+  switch (tier) {
+    case "idle": return DIM;
+    case "qa": return YELLOW;
+    case "ship": return GREEN;
+    case "done": return PURPLE;
+    default: return CYAN; // "active", or unknown/not-yet-fetched
+  }
+}
+
+// hubdiff (local diff-viewing app) glyph, right after the ◆ Shortcut glyph.
+// `±` is the plus/minus of a diff in one cell — single-width, text-presentation
+// in plain fonts, and unambiguous next to the other glyphs. Shown on EVERY row:
+// hubdiff takes the worktree directory, so it's always available (unlike the PR
+// or story links, which need a slug / ticket id) — hence bright white rather
+// than a status hue. cmd/ctrl-click → that worktree's diff in hubdiff.
+const DIFF_GLYPH = "±";
+const HUBDIFF_BASE = "http://hubdiff.localhost/";
+
+function hubdiffUrl(wtPath: string): string {
+  return `${HUBDIFF_BASE}?repo=${encodeURIComponent(wtPath)}`;
+}
+
+function gitGlyph(prUrl: string | undefined, merged: boolean, pushed: boolean): string {
   // The trailing space lives INSIDE the linked/glyph text so the cmd-click
   // target extends one cell to the right of the glyph — a bare glyph is a
   // one-cell target and reads as "only the left side is clickable". Combined
   // with the literal space before the name in render(), this also yields two
   // spaces of separation between the glyph and the branch name. The unlinked
   // (no-PR) case carries the same trailing space so the name column stays aligned.
+  // webLink, so this reuses a tab like every other http link here. prUrl comes in
+  // two shapes and the handler keys each on its own: the resolved /pull/<n>, and
+  // the /pulls?q=head:<branch> search fallback that a branch with no PR yet keeps
+  // forever. Keying them separately is deliberate — once `gh` resolves, the click
+  // moves off the stale search tab to the real PR instead of sticking to it.
   if (!prUrl) return `${DIM}${GIT_GLYPH} ${RESET}`;
-  if (merged) return link(`${PURPLE}${MERGED_GLYPH} ${RESET}`, prUrl);
-  return link(`${MAGENTA}${GIT_GLYPH} ${RESET}`, prUrl);
+  // merged is checked BEFORE pushed on purpose: GitHub deletes the head branch on
+  // merge, so origin/<branch> is gone and pushed goes false exactly when the row
+  // most deserves its purple ↥. Merged wins.
+  if (merged) return webLink(`${PURPLE}${MERGED_GLYPH} ${RESET}`, prUrl);
+  // Nothing pushed yet, so prUrl here is always the head-ref search fallback and it
+  // lands on an empty result list. Still linked (it's a valid place to go once you
+  // push, and unlinking would shift the click target), just visibly not-a-PR-yet.
+  if (!pushed) return webLink(`${DIM_MAGENTA}${GIT_GLYPH} ${RESET}`, prUrl);
+  return webLink(`${MAGENTA}${GIT_GLYPH} ${RESET}`, prUrl);
 }
 
 // Fixed-width PR-approval slot, sits between the CI dot and the ⎇ glyph: one
@@ -864,19 +1147,42 @@ function fitBranch(branch: string, width: number): string {
 }
 
 // Branch names get a fixed display window; anything longer marquees instead of
-// truncating (see marquee). Capped to the pane width on narrow terminals.
+// truncating (see marquee). Capped to the pane width on narrow terminals — the
+// subtracted budget is the glyph gutter left of the name (dot + approvals +
+// ⎇ + ◆ + ±, with their spaces) plus the trailing agent glyph.
 const NAME_WIDTH = 36;
 function nameWindow(sepWidth: number): number {
-  return Math.min(NAME_WIDTH, Math.max(10, sepWidth - 15));
+  return Math.min(NAME_WIDTH, Math.max(10, sepWidth - 17));
 }
+
+
+// How many animation frames a marquee rests at its home position (first character
+// flush left) before scrolling again. At ANIM_INTERVAL_MS = 500 this is a ~3s pause.
+const MARQUEE_HOLD_FRAMES = 6;
 
 // Marquee a branch name that overflows the window: show a `width`-char slice
 // that advances one char per animation frame, wrapping around with a small gap
 // so the tail and head don't visually collide. Names that fit are returned as-is.
+//
+// The cycle PAUSES at offset 0 — the name's first character flush against the left
+// of its window — for MARQUEE_HOLD_FRAMES before scrolling off again. Without the
+// pause the text slid continuously and you could never catch the start of a name
+// without waiting for exactly the right instant; the rest at home makes the
+// beginning the one position that's reliably readable.
+//
+// One shared `frame` drives every row, so all the marquees rest in step rather than
+// each pausing at its own moment.
 function marquee(name: string, width: number, frame: number): string {
   if (name.length <= width) return name;
   const track = name + "   "; // gap before it wraps back to the start
-  const off = frame % track.length;
+  // Each full cycle is: hold at home, then one character-step per frame through the
+  // rest of the track, ending just before it would land back on home.
+  // The `+ 1` is why the scroll resumes at offset 1: without it, the first scrolling
+  // frame recomputes offset 0 and home is visibly held for HOLD_FRAMES + 1 frames.
+  // Cycle length is track.length - 1 + HOLD for the same reason — offsets 1..len-1
+  // are stepped through, and offset 0 is the held one.
+  const t = frame % (track.length - 1 + MARQUEE_HOLD_FRAMES);
+  const off = t < MARQUEE_HOLD_FRAMES ? 0 : t - MARQUEE_HOLD_FRAMES + 1;
   return (track + track).slice(off, off + width);
 }
 
@@ -902,11 +1208,11 @@ function render(worktrees: Worktree[], err: Error | null, frame: number): void {
     return;
   }
 
-  // Layout:  <ci-dot> <approvals> <git-glyph> <sc-glyph> <branch> <dev-marker> <agent-glyph> [×N] [note]
-  // ci-dot + approvals + git-glyph eat ~7 cols, the animated agent glyph is up to
-  // RUN_TRACK dots + spacing (~6), count/note wrap after — leave room so a long
-  // branch truncates instead of wrapping.
-  const branchMax = Math.max(10, sepWidth - 15);
+  // Layout:  <ci-dot> <approvals> <git-glyph> <sc-glyph> <diff-glyph> <branch> <dev-marker> <agent-glyph>
+  // ci-dot + approvals + git/sc/diff glyphs eat ~11 cols, the animated agent glyph
+  // is up to RUN_TRACK dots + spacing (~6), count/note wrap after — leave room so a
+  // long branch truncates instead of wrapping.
+  const branchMax = Math.max(10, sepWidth - 17);
   const nameW = nameWindow(sepWidth);
 
   for (const w of worktrees) {
@@ -925,42 +1231,74 @@ function render(worktrees: Worktree[], err: Error | null, frame: number): void {
     const nameLink = link(styled, `cursor://file/${w.wtPath}?windowId=_blank`);
 
     // CI dot links to the workflow if we have a URL; otherwise it's a plain dot.
-    const dot = w.ci.url ? link(ciDot(w.ci.status), w.ci.url) : ciDot(w.ci.status);
+    const dot = w.ci.url ? webLink(ciDot(w.ci.status), w.ci.url) : ciDot(w.ci.status);
+
+    // The main-checkout row keeps ONLY the CI dot, the name link and the agent/dev
+    // markers. Everything else is a per-branch-of-work signal that master has no
+    // answer for — there's no PR to approve, no story behind it, and its "diff" is
+    // the baseline everything else diffs against. Each exemption still emits its
+    // column's exact width in spaces, so master lines up with the rows above it
+    // instead of shifting the whole name column.
+    const bare = w.isMain;
 
     // PR-approval progress (✓✓ / ✓· / ··), fixed width, between the dot and glyph.
-    const approvals = approvalsSlot(w.approvals);
+    const approvals = bare ? " ".repeat(APPROVALS_NEEDED) : approvalsSlot(w.approvals);
 
     // git glyph between the approvals and the name → the branch's GitHub PR.
-    const git = gitGlyph(w.prUrl, w.merged);
+    // Blank on master: the only link we could offer is a head:master PR search,
+    // which is guaranteed empty and reads as a broken link.
+    const git = bare ? "  " : gitGlyph(w.prUrl, w.merged, w.pushed);
 
     // Shortcut ticket glyph, right after the GH glyph → the branch's story.
     // Fixed 2 cells (blank when the branch has no sc- id) so the name column
     // stays aligned across rows. The trailing space rides inside the link (like
     // gitGlyph) so the cmd-click target extends one cell past the glyph.
-    const scUrl = shortcutUrl(w.branch);
-    const sc = scUrl ? link(`${CYAN}${SC_GLYPH} ${RESET}`, scUrl) : "  ";
+    const scUrl = bare ? undefined : shortcutUrl(w.branch);
+    const sc = scUrl ? webLink(`${scColor(w.scTier)}${SC_GLYPH} ${RESET}`, scUrl) : "  ";
 
-    const count = w.agents.length > 1 ? `${DIM} ×${w.agents.length}${RESET}` : "";
-    // The error note (e.g. "out of usage") is intentionally not rendered: it
-    // always wrapped and broke the narrow pane. The ✗ agent glyph already
-    // signals "there was an issue" — cmd-click the branch to see the detail.
+    // hubdiff glyph → this worktree's diff. Same trailing-space-inside-the-link
+    // trick as the glyphs above, so the click target is 2 cells wide. Blank on
+    // master — it's the baseline the other rows diff against, so "its diff" is empty
+    // by definition.
+    const diff = bare ? "  " : webLink(`${WHITE}${DIFF_GLYPH} ${RESET}`, hubdiffUrl(w.wtPath));
+
+    // No "×N" session counter: a row is one agent — the newest session for that
+    // worktree (see newestAgentFor). The count inflated the row for no decision it
+    // helped you make, and the badge beside it mixed states from separate runs.
+    // The error note (e.g. "out of usage") is likewise not rendered: it always
+    // wrapped and broke the narrow pane. The ✗ agent glyph already signals "there
+    // was an issue" — cmd-click the branch to see the detail.
 
     // Blue ◂ = "this worktree is serving DEV_PORT", anchored one space off the
-    // branch name's right edge. Pad AFTER it (filling the rest of the name
-    // column) so the trailing agent glyph still lines up across rows whatever the
-    // name/marker length. " ◂" is 2 cells; nameW + 2 keeps the agent-glyph column
-    // exactly where the old fixed-slot layout put it.
+    // branch name's right edge, so it travels WITH the name rather than sitting at
+    // a fixed column.
     const dev = w.devRunning ? ` ${BLUE}${DEV_GLYPH}${RESET}` : "";
     const devWidth = w.devRunning ? 2 : 0; // " ◂"
-    const pad = " ".repeat(Math.max(0, nameW + 2 - nameText.length - devWidth));
 
-    console.log(`${dot} ${approvals} ${git} ${sc}${nameLink}${dev}${pad} ${agentGlyph(w.agentState, frame)}${count}`);
+    // The name (plus its dev marker) is CENTERED in the name column: split the
+    // leftover cells either side instead of dumping them all after the name. The
+    // total is still exactly nameW + 2, which is what keeps the trailing agent glyph
+    // in one column across every row — only where the slack sits changes.
+    // Odd slack gives the extra cell to the RIGHT, so a name sits one cell left of
+    // true centre rather than drifting into the agent glyph.
+    // Names long enough to marquee fill the window exactly, so they have no slack to
+    // split and are unaffected; this is really about the short ones (master).
+    const slack = Math.max(0, nameW + 2 - nameText.length - devWidth);
+    const padL = " ".repeat(Math.floor(slack / 2));
+    const padR = " ".repeat(slack - Math.floor(slack / 2));
+
+    console.log(`${dot} ${approvals} ${git} ${sc}${diff}${padL}${nameLink}${dev}${padR} ${agentGlyph(w.agentState, frame)}`);
 
     // Under a failing branch, list each failed job indented, hyperlinked to its
     // own CircleCI job page (the dot links the workflow; these drill to the job).
+    // Skipped on master: a red master is somebody's whole-team problem, not a
+    // this-worktree to-do, and the indents are exactly the panel-inflating noise
+    // this row is meant to avoid. The ● dot still carries the status and still
+    // cmd-clicks through to the workflow.
+    if (bare) continue;
     for (const job of w.ci.failedJobs ?? []) {
       const label = truncate(job.name, Math.max(6, branchMax - 2));
-      console.log(`  ${DIM}⎿${RESET} ${link(`${RED}${label}${RESET}`, job.url)}`);
+      console.log(`  ${DIM}⎿${RESET} ${webLink(`${RED}${label}${RESET}`, job.url)}`);
     }
   }
 
@@ -1035,11 +1373,14 @@ if (process.argv.includes("--mock")) {
   const t = Date.now();
   render(
     [
-      { repo: "popmenu", wtPath: "/x", branch: "steele/migrate-shortcut", agents: [{ uuid: "a", mtime: t - 5_000, state: "done", closed: false }], mtime: t - 5_000, agentState: "running", ci: { status: "running", url: "https://x" }, prUrl: "https://github.com/Popmenu/popmenu/pulls?q=is%3Apr+head%3Asteele%2Fmigrate-shortcut", approvals: 1, merged: false, devRunning: true },
-      { repo: "popmenu", wtPath: "/y", branch: "steele/sc-170267/list-list-enumerate-clean-up-items-for-text", agents: [{ uuid: "b", mtime: t - 120_000, state: "done", closed: false }], mtime: t - 120_000, agentState: "waiting", ci: { status: "success", url: "https://y" }, prUrl: "https://github.com/Popmenu/popmenu/pulls?q=is%3Apr+head%3Asteele%2Fsc-170267", approvals: 2, merged: false, devRunning: false },
-      { repo: "popmenu", wtPath: "/z", branch: "steele/sc-170112/fix-webhook-retry", agents: [{ uuid: "d", mtime: t - 480_000, state: "error", closed: true, note: "aborted" }], mtime: t - 480_000, agentState: "error", ci: { status: "failed", url: "https://z" }, prUrl: "https://github.com/Popmenu/popmenu/pulls?q=is%3Apr+head%3Asteele%2Fsc-170112", approvals: 0, merged: false, devRunning: false },
-      { repo: "popmenu", wtPath: "/m", branch: "steele/sc-169044/already-merged-cleanup", agents: [{ uuid: "e", mtime: t - 900_000, state: "done", closed: true }], mtime: t - 900_000, agentState: "done", ci: { status: "success", url: "https://m" }, prUrl: "https://github.com/Popmenu/popmenu/pull/12345", approvals: 2, merged: true, devRunning: false },
-      { repo: "term-dash", wtPath: "/w", branch: "steele/worktree-panel", agents: [], mtime: 0, agentState: "none", ci: { status: "unknown" }, approvals: 0, merged: false, devRunning: false },
+      // main checkout: CI dot + name only, pinned first (see gather/render `isMain`).
+      // Listed first here too so --mock matches the order gather() produces.
+      { repo: "popmenu", wtPath: "/popmenu", branch: "master", agent: { uuid: "z", mtime: t - 60_000, state: "done", closed: true }, isMain: true, mtime: t - 60_000, agentState: "done", ci: { status: "failed", url: "https://ci-master" }, prUrl: "https://github.com/Popmenu/popmenu/pulls?q=head%3Amaster", approvals: 2, merged: false, pushed: true, devRunning: false },
+      { repo: "popmenu", wtPath: "/x", branch: "steele/migrate-shortcut", agent: { uuid: "a", mtime: t - 5_000, state: "done", closed: false }, mtime: t - 5_000, agentState: "running", ci: { status: "running", url: "https://x" }, prUrl: "https://github.com/Popmenu/popmenu/pulls?q=is%3Apr+head%3Asteele%2Fmigrate-shortcut", approvals: 1, merged: false, pushed: false, isMain: false, devRunning: true },
+      { repo: "popmenu", wtPath: "/y", branch: "steele/sc-170267/list-list-enumerate-clean-up-items-for-text", agent: { uuid: "b", mtime: t - 120_000, state: "done", closed: false }, mtime: t - 120_000, agentState: "waiting", ci: { status: "success", url: "https://y" }, prUrl: "https://github.com/Popmenu/popmenu/pulls?q=is%3Apr+head%3Asteele%2Fsc-170267", approvals: 2, merged: false, pushed: true, isMain: false, devRunning: false },
+      { repo: "popmenu", wtPath: "/z", branch: "steele/sc-170112/fix-webhook-retry", agent: { uuid: "d", mtime: t - 480_000, state: "error", closed: true, note: "aborted" }, mtime: t - 480_000, agentState: "error", ci: { status: "failed", url: "https://z" }, prUrl: "https://github.com/Popmenu/popmenu/pulls?q=is%3Apr+head%3Asteele%2Fsc-170112", approvals: 0, merged: false, pushed: true, isMain: false, devRunning: false },
+      { repo: "popmenu", wtPath: "/m", branch: "steele/sc-169044/already-merged-cleanup", agent: { uuid: "e", mtime: t - 900_000, state: "done", closed: true }, mtime: t - 900_000, agentState: "done", ci: { status: "success", url: "https://m" }, prUrl: "https://github.com/Popmenu/popmenu/pull/12345", approvals: 2, merged: true, pushed: false, isMain: false, devRunning: false },
+      { repo: "term-dash", wtPath: "/w", branch: "steele/worktree-panel", mtime: 0, agentState: "none", ci: { status: "unknown" }, approvals: 0, merged: false, pushed: false, isMain: false, devRunning: false },
     ],
     null,
     1 // fixed frame — white bead one slot in, so the animation is visible in a still
