@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.colinsteele.morning-brief</string>
+
+  <!-- zsh -lic for the same reason herdr-sync needs it: -i gets .zshrc (nvm,
+       and therefore the node that `npx tsx` runs on) and -l gets /etc/zprofile
+       (path_helper, and therefore /opt/homebrew/bin). It also gets the three
+       tokens the brief reads — GITHUB_TOKEN, SHORTCUT_RO_TOKEN,
+       SENTRY_AUTH_TOKEN — which live in ~/.zsh-sources/exports.zsh and are
+       invisible to a bare launchd environment.
+
+       It also gets `claude`, which lives in the nvm node bin dir and is what
+       generates the Sentry one-line summaries on first sight of an issue. If it
+       is ever unreachable from here the brief still prints — the summary layer
+       falls back to raw Sentry titles rather than failing. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lic</string>
+    <string>exec "$HOME/Code/term-dash/morning-brief.ts" --write</string>
+  </array>
+
+  <!-- 06:00. StartCalendarInterval, NOT cron, and that is the point: if the Mac
+       was asleep at 6am launchd runs the job on wake, where cron would simply
+       have missed it. A brief that silently does not exist on the mornings you
+       slept in is worse than no brief. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>6</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <!-- One shot per fire. This is not a daemon; KeepAlive would relaunch it
+       forever. -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/colinsteele/.cache/termdash/morning-brief.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/colinsteele/.cache/termdash/morning-brief.log</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/colinsteele/Code/term-dash</string>
+</dict>
+</plist>
