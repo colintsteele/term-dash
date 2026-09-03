@@ -83,6 +83,7 @@ import {
   resolvePr,
   shortcutTiers,
   summarizeComments,
+  APPROVALS_NEEDED,
   NO_PR,
   type CommentSummary,
   type Pr,
@@ -104,6 +105,120 @@ function readCollapsed(): Set<string> {
     return new Set(JSON.parse(fs.readFileSync(COLLAPSED_PATH, "utf8")) as string[]);
   } catch {
     return new Set();
+  }
+}
+
+// ── merge-ready notifications ───────────────────────────────────────────────
+//
+// Branches already announced as ready, so the popup fires on the EDGE and not
+// once every poll. Keyed by branch and persisted, because the alternative — an
+// in-memory Set — re-announces every PR the first cycle after any restart, and
+// this daemon restarts whenever launchd reloads it.
+//
+// A branch is removed once it stops being ready, so a re-freeze followed by
+// another thaw announces again. That is the point: the notification tracks the
+// transition, not the PR.
+const MERGE_READY_PATH = path.join(os.homedir(), ".local/state/herdr/merge-ready.json");
+
+function readMergeReady(): Set<string> {
+  try {
+    return new Set(JSON.parse(fs.readFileSync(MERGE_READY_PATH, "utf8")) as string[]);
+  } catch {
+    return new Set();
+  }
+}
+
+function writeMergeReady(branches: Set<string>): void {
+  try {
+    fs.mkdirSync(path.dirname(MERGE_READY_PATH), { recursive: true });
+    fs.writeFileSync(MERGE_READY_PATH, JSON.stringify([...branches]));
+  } catch {
+    /* worst case the popup repeats after a restart — not worth failing a cycle */
+  }
+}
+
+// Every condition GitHub's merge button checks, as far as we can see it from
+// here. mergeStateStatus is the freeze-sensitive one: on this repo it sits at
+// BLOCKED with green checks and both approvals in, and only goes CLEAN once the
+// repo is open for merging again.
+function mergeReady(pr: Pr, ci: Ci | undefined): boolean {
+  return (
+    !pr.merged &&
+    !pr.isDraft &&
+    pr.number !== null &&
+    pr.approvals >= APPROVALS_NEEDED &&
+    pr.mergeStateStatus === "CLEAN" &&
+    ci?.status === "success"
+  );
+}
+
+// Fire-and-forget: a popup that fails is not worth losing a paint cycle over.
+// --sound done rather than request, which is the "agent wants you" chime.
+async function notifyMergeReady(name: string, pr: Pr): Promise<void> {
+  try {
+    await herdr([
+      "notification", "show", "Ready to merge",
+      "--body", `#${pr.number} ${name} — approved, CI green, repo open`,
+      "--position", "top-right",
+      "--sound", "done",
+    ]);
+    log(`notified: #${pr.number} ${name} is ready to merge`);
+  } catch (err) {
+    log(`notification failed for ${name}: ${(err as Error).message}`);
+  }
+}
+
+// ── CI-failure notifications ────────────────────────────────────────────────
+//
+// Same edge-triggered shape as merge-ready above, and separate state so the two
+// cannot mask each other: a branch can be announced failing, get fixed, and be
+// announced ready without either file knowing about the other.
+//
+// Removed from the set once CI stops failing, so a re-break announces again —
+// which is the whole point on a branch you are pushing fixes to.
+const CI_FAILED_PATH = path.join(os.homedir(), ".local/state/herdr/ci-failed.json");
+
+function readCiFailed(): Set<string> {
+  try {
+    return new Set(JSON.parse(fs.readFileSync(CI_FAILED_PATH, "utf8")) as string[]);
+  } catch {
+    return new Set();
+  }
+}
+
+function writeCiFailed(branches: Set<string>): void {
+  try {
+    fs.mkdirSync(path.dirname(CI_FAILED_PATH), { recursive: true });
+    fs.writeFileSync(CI_FAILED_PATH, JSON.stringify([...branches]));
+  } catch {
+    /* worst case the popup repeats after a restart */
+  }
+}
+
+// --sound request, not done: this is the "something wants you" chime, whereas
+// merge-ready earns the satisfied one.
+//
+// NOTE ON DURATION: Herdr gives no control over how long a toast stays up.
+// `duration_ms` exists inside the binary but is not exposed in config.toml, and
+// `notification.show` takes only title/body/position/sound. An ~8s toast is not
+// expressible; `[ui.toast] delivery = "system"` hands off to macOS Notification
+// Center instead, which persists until dismissed.
+async function notifyCiFailed(name: string, pr: Pr, ci: Ci): Promise<void> {
+  const jobs = ci.failedJobs ?? [];
+  const detail = jobs.length
+    ? jobs.slice(0, 3).map((j) => j.name).join(", ") + (jobs.length > 3 ? `, +${jobs.length - 3} more` : "")
+    : "see CircleCI";
+  const num = pr.number !== null ? `#${pr.number} ` : "";
+  try {
+    await herdr([
+      "notification", "show", "CI failed",
+      "--body", `${num}${name} — ${detail}`,
+      "--position", "top-right",
+      "--sound", "request",
+    ]);
+    log(`notified: ${name} CI failed (${detail})`);
+  } catch (err) {
+    log(`ci-failed notification failed for ${name}: ${(err as Error).message}`);
   }
 }
 
@@ -729,6 +844,8 @@ async function cycle(): Promise<void> {
     if (live.length === 0) continue;
 
     const collapsed = readCollapsed();
+    const announced = readMergeReady();
+    const failAnnounced = readCiFailed();
     const sbWidth = sidebarWidth();
     const branches = new Set(live.map(({ wt }) => wt.branch));
     const mainBranches = new Set(
@@ -810,6 +927,30 @@ async function cycle(): Promise<void> {
         devRunning: [...devDirs].some((d) => d === wt.path || d.startsWith(wt.path + "/")),
         comments: cmtMap.get(wt.branch) ?? [],
       };
+      // Edge-triggered, and deliberately not gated on DRY_RUN's `continue`
+      // below: a dry run should still say what it WOULD announce.
+      const pr = input.pr;
+      const ready = mergeReady(pr, input.ci);
+      if (ready && !announced.has(wt.branch)) {
+        announced.add(wt.branch);
+        if (DRY_RUN) log(`would notify: #${pr.number} ${worktreeName} ready to merge`);
+        else await notifyMergeReady(worktreeName, pr);
+      } else if (!ready && announced.has(wt.branch)) {
+        announced.delete(wt.branch);
+      }
+
+      // CI failure, same edge shape. Guarded on input.ci existing at all: a
+      // null ci means the CircleCI call failed or the branch has no pipeline,
+      // which is not the same as red and must not announce.
+      const ciFailing = input.ci !== undefined && isFailing(input.ci.status);
+      if (ciFailing && !failAnnounced.has(wt.branch)) {
+        failAnnounced.add(wt.branch);
+        if (DRY_RUN) log(`would notify: ${worktreeName} CI failed`);
+        else await notifyCiFailed(worktreeName, pr, input.ci!);
+      } else if (!ciFailing && failAnnounced.has(wt.branch)) {
+        failAnnounced.delete(wt.branch);
+      }
+
       const tokens = buildTokens(input);
       if (DRY_RUN) {
         log(`${space.workspace_id} ${worktreeName} → ${describe(tokens)}`);
@@ -846,6 +987,9 @@ async function cycle(): Promise<void> {
         }
       }
     }
+
+    if (!DRY_RUN) writeMergeReady(announced);
+    if (!DRY_RUN) writeCiFailed(failAnnounced);
 
     if (!DRY_RUN) {
       log(

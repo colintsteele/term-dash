@@ -51,6 +51,15 @@ import path from "node:path";
 const execFileP = promisify(execFile);
 const HOME = os.homedir();
 
+// `gh` by bare name is a trap under launchd. /opt/homebrew/bin only reaches PATH
+// via path_helper in /etc/zprofile, and a non-login shell never reads that file —
+// so herdr-sync's `zsh -ic` had node (nvm, from .zshrc) but no gh. Every call
+// below threw ENOENT straight into a quiet catch, which is why every PR read as
+// zero approvals and no comments for weeks with nothing in the log. Resolved
+// absolute, the way HERDR is in herdr-sync.ts, with a PATH lookup as the
+// last-resort fallback for machines where brew lives somewhere else.
+const GH = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"].find((p) => fs.existsSync(p)) ?? "gh";
+
 // ── the token vocabulary ────────────────────────────────────────────────────
 // Every token this module owns. Painting blanks the whole set first, so a
 // signal that disappears (PR merged, CI job fixed) clears instead of lingering
@@ -146,11 +155,20 @@ export interface Pr {
   url: string | null;
   number: number | null;
   approvals: number;
+  // GitHub's own verdict on whether the merge button is live: CLEAN, BLOCKED,
+  // BEHIND, DIRTY, UNSTABLE, ... A repo-wide merge freeze shows up here as
+  // BLOCKED even when checks are green and reviews are in, which is what makes
+  // the CLEAN transition usable as an "unfrozen" edge.
+  mergeStateStatus: string | null;
+  isDraft: boolean;
   merged: boolean;
   paths: string[]; // changed files, for the CODEOWNERS check below
 }
 
-export const NO_PR: Pr = { url: null, number: null, approvals: 0, merged: false, paths: [] };
+export const NO_PR: Pr = {
+  url: null, number: null, approvals: 0, merged: false, paths: [],
+  mergeStateStatus: null, isDraft: false,
+};
 
 // ── architecture sign-off ───────────────────────────────────────────────────
 //
@@ -216,10 +234,11 @@ export async function resolvePr(repo: string | null, branch: string): Promise<Pr
   if (!repo) return NO_PR;
   try {
     const { stdout } = await execFileP(
-      "gh",
+      GH,
       ["pr", "list", "--repo", repo, "--head", branch, "--state", "all",
-       "--json", "url,number,state,latestReviews,files", "--limit", "1",
-       "--jq", '.[0] // empty | {url, number, merged: (.state == "MERGED"), approvals: ([.latestReviews[] | select(.state=="APPROVED")] | length), paths: [.files[]?.path]}'],
+       "--json", "url,number,state,latestReviews,files,mergeStateStatus,isDraft",
+       "--limit", "1",
+       "--jq", '.[0] // empty | {url, number, merged: (.state == "MERGED"), approvals: ([.latestReviews[] | select(.state=="APPROVED")] | length), paths: [.files[]?.path], mergeStateStatus, isDraft}'],
       { timeout: 8000 }
     );
     const out = stdout.trim();
@@ -231,9 +250,17 @@ export async function resolvePr(repo: string | null, branch: string): Promise<Pr
       approvals: o.approvals ?? 0,
       merged: o.merged ?? false,
       paths: o.paths ?? [],
+      mergeStateStatus: o.mergeStateStatus ?? null,
+      isDraft: o.isDraft ?? false,
     };
-  } catch {
-    return NO_PR; // gh missing, unauthed, rate-limited, or slow — fail quiet
+  } catch (err) {
+    // A missing binary is a config fault that will never clear on its own, unlike
+    // a rate limit or a timeout. Say so on stderr — the launchd log — instead of
+    // reporting every PR in the sidebar as unapproved in silence.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      console.error(`gh not found at ${GH} — PR state unavailable`);
+    }
+    return NO_PR; // unauthed, rate-limited, or slow — fail quiet
   }
 }
 
@@ -526,7 +553,7 @@ async function resolvedCommentIds(repo: string, prNumber: number): Promise<Set<s
   const [owner, name] = repo.split("/");
   try {
     const { stdout } = await execFileP(
-      "gh",
+      GH,
       ["api", "graphql", "-f", `query=query($o:String!,$r:String!,$n:Int!){
         repository(owner:$o,name:$r){ pullRequest(number:$n){
           reviewThreads(first:100){ nodes{ isResolved comments(first:100){ nodes{ databaseId } } } } } } }`,
@@ -540,23 +567,40 @@ async function resolvedCommentIds(repo: string, prNumber: number): Promise<Set<s
   }
 }
 
+// Authors whose TOP-LEVEL comments are boilerplate, not review. Scoped to the
+// issue-level endpoint only — Bugbot's inline comments are real findings and
+// must survive. On a sample PR the split was exactly:
+//
+//   issues/…/comments  cursor[bot]  "## PR Summary <!-- CURSOR_SUMMARY --> ..."
+//   pulls/…/comments   cursor[bot]  "Reasoning read from wrong field · Medium"
+//
+// so the endpoint IS the distinction; no body-sniffing needed. Costs nothing to
+// get wrong in the safe direction either: with only $cmt1-6 to spend, a dropped
+// summary frees a slot for something actionable.
+const TOP_LEVEL_NOISE_AUTHORS = new Set([
+  "cursor[bot]",              // "## PR Summary" — the same review it already left inline
+  "shortcut-integration[bot]", // "This pull request has been linked to Shortcut Story #..."
+]);
+
 export async function fetchComments(repo: string, prNumber: number): Promise<RawComment[]> {
   const out: RawComment[] = [];
-  const endpoints = [
-    `repos/${repo}/pulls/${prNumber}/comments`,
-    `repos/${repo}/issues/${prNumber}/comments`,
+  const endpoints: { path: string; topLevel: boolean }[] = [
+    { path: `repos/${repo}/pulls/${prNumber}/comments`, topLevel: false },
+    { path: `repos/${repo}/issues/${prNumber}/comments`, topLevel: true },
   ];
-  for (const ep of endpoints) {
+  for (const { path: ep, topLevel } of endpoints) {
     try {
       const { stdout } = await execFileP(
-        "gh",
+        GH,
         ["api", `${ep}?per_page=50`, "--jq",
          '.[] | {id: (.id|tostring), author: .user.login, body: .body, url: .html_url, created: .created_at}'],
         { timeout: 10_000, maxBuffer: 8 << 20 }
       );
       for (const line of stdout.trim().split("\n")) {
         if (!line) continue;
-        out.push(JSON.parse(line));
+        const c = JSON.parse(line) as RawComment;
+        if (topLevel && TOP_LEVEL_NOISE_AUTHORS.has(c.author)) continue;
+        out.push(c);
       }
     } catch {
       /* one endpoint failing shouldn't lose the other */
