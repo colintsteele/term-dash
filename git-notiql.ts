@@ -26,7 +26,8 @@
  *   reaction on the mentioning comment.
  *
  * YOUR TEAM'S REVIEW QUEUE — from SHORTCUT, not GitHub:
- *   🤝  a PR attached to a ticket sitting in your team's "Ready for Review" column
+ *   🤝  a PR attached to a ticket in your team's "Ready for Review" OR "In
+ *       Development" column — see SC_REVIEW_STATE_NAMES for why both
  *       that still needs review (not yours, not draft/closed/merged, and not
  *       already approved).
  *   Shortcut-driven because the GitHub framings are unusable at this repo's scale:
@@ -35,7 +36,7 @@
  *   filtering — the same question with three orders of magnitude less noise.
  *   Needs SHORTCUT_RO_TOKEN; without it the category is skipped and nothing else
  *   changes. Team + column are configured BY NAME (SC_TEAM_NAME /
- *   SC_REVIEW_STATE_NAME) and resolved to ids at runtime.
+ *   SC_REVIEW_STATE_NAMES) and resolved to ids at runtime.
  *   Clears itself when the story leaves Ready for Review.
  *
  * PENDING REVIEW REQUESTS — PRs where you're a requested reviewer:
@@ -91,6 +92,11 @@
  *     no PR data pulled. Useful without disturbing the live pane's layout.
  */
 
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { summarizeComments, type RawComment } from "./herdr-space-tokens.ts";
+
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 // With per-PR caching skipping GraphQL calls for anything unchanged since
 // the last poll, steady-state cost should be well under naive worst case.
@@ -111,7 +117,20 @@ const SHORTCUT_API = "https://api.app.shortcut.com/api/v3";
 // this category off — a rename produces no badges, but so would a stale id, and a
 // name is at least something you can eyeball against the Shortcut UI.
 const SC_TEAM_NAME = "Marketeers";
-const SC_REVIEW_STATE_NAME = "Ready for Review";
+
+// Plural, and BOTH entries earn their place.
+//
+// "Ready for Review" is the column this category is named after. "In Development"
+// is here because the column is a human ritual and the PR is not: people open a
+// PR and forget to drag the ticket, and that PR is then invisible to a query
+// keyed on the column. Measured on the live board, In Development held exactly
+// one open non-draft PR still awaiting review and Ready for Review held four —
+// so this widening costs one row and closes the hole.
+//
+// The post-review states (Ready for QA / In QA / Ready for Merge) are left OUT
+// on purpose: a ticket only reaches them after someone reviewed it, and the
+// GitHub approval gate in filterUnapprovedOnGitHub would drop them anyway.
+const SC_REVIEW_STATE_NAMES = ["Ready for Review", "In Development"];
 
 // Your own PRs are excluded — you don't need to review your own work. Matched on the
 // branch PREFIX because that's the only author-ish signal Shortcut hands back on an
@@ -131,6 +150,59 @@ interface ReviewThread {
   isResolved: boolean;
   isOutdated: boolean;
   comments: { nodes: GraphQLComment[] };
+}
+
+// ---- comment summaries: this pane is the PRODUCER ----
+//
+// The summariser and its cache live in herdr-space-tokens.ts, keyed by comment
+// id in ~/.local/state/herdr/comment-summaries.json. A comment's text never
+// changes, so each id is summarised exactly ONCE, ever; this pane is where that
+// cache gets filled, and morning-brief.ts and the Herdr sidebar are readers.
+//
+// Why here rather than in the brief: every comment this pane badges has already
+// been fetched WITH ITS BODY for the badge logic, so summarising what is already
+// in hand costs zero additional API calls. No other consumer can say that — the
+// brief would have to re-fetch, and it runs once a day at 06:00 against a cold
+// cache. Warming from the pane that polls every 60s means the brief's rows are
+// almost always already paid for by the time it runs.
+//
+// REST ids on purpose: the `#discussion_r<id>` / `#issuecomment-<id>` fragment of
+// a GraphQL comment url is the same number fetchComments() reports, so both
+// producers share ONE keyspace instead of summarising a comment twice under two.
+const COMMENT_ID_RE = /#(?:discussion_r|issuecomment-)(\d+)/;
+const seenComments = new Map<string, RawComment>();
+
+function noteComments(nodes: GraphQLComment[]): void {
+  for (const c of nodes) {
+    const m = c.url?.match(COMMENT_ID_RE);
+    if (!m) continue;
+    seenComments.set(m[1], {
+      id: m[1],
+      author: c.author?.login ?? "?",
+      body: c.body ?? "",
+      url: c.url,
+    });
+  }
+}
+
+// Deliberately never awaited by the render path. Summarising shells out to
+// headless Claude with a 120s timeout and this pane repaints every 60s, so
+// blocking the paint on it would turn a nicety into a stall. The guard is what
+// keeps two overlapping polls from running the summariser twice over one batch.
+let warming = false;
+async function warmCommentSummaries(): Promise<void> {
+  if (warming) return;
+  const raw = [...seenComments.values()].filter((c) => c.body.trim());
+  seenComments.clear();
+  if (raw.length === 0) return;
+  warming = true;
+  try {
+    await summarizeComments(raw);
+  } catch {
+    /* a failed warm costs a re-ask on the next poll, not correctness */
+  } finally {
+    warming = false;
+  }
 }
 
 interface RateLimitInfo {
@@ -279,6 +351,12 @@ const SHOW_CURSOR = "\x1b[?25h";
 const YELLOW = "\x1b[33m";
 const ORANGE = "\x1b[38;5;208m";
 const RED = "\x1b[31m";
+// The one clickable affordance in this pane, so it gets the one colour nothing
+// else here uses. Same blue as the ⎇ PR link in the peers pane on purpose: across
+// the dashboard, this blue means "this is a link and it goes to GitHub".
+// Dim was wrong for it — dim is what the pane says when it has nothing to offer
+// ("no pending replies"), which is the opposite of an action.
+const LINK_BLUE = "\x1b[38;5;75m";
 
 function rateLimitColor(remaining: number, limit: number): string {
   const pct = (remaining / limit) * 100;
@@ -456,6 +534,7 @@ async function fetchOwnPRBadges(
 
     const prBadges: Badge[] = [];
     for (const thread of threads) {
+      noteComments(thread.comments.nodes);
       const comments = [...thread.comments.nodes].sort(
         (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
       );
@@ -525,6 +604,7 @@ async function fetchParticipatingBadges(
 
     const prBadges: Badge[] = [];
     for (const thread of threads) {
+      noteComments(thread.comments.nodes);
       const comments = [...thread.comments.nodes].sort(
         (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
       );
@@ -789,9 +869,10 @@ async function fetchMentionBadges(
 //                 group+state search returns a pile of long-dead tickets that
 //                 aren't in the column you're looking at. 9 of 12, when this was
 //                 written. Filtering this is not optional.
-//   review_status — Shortcut tracks GitHub's review state on the attached PR, so
-//                 "approved" ones drop out. Without it, 3 stories would badge 3 PRs,
-//                 two of which had already been reviewed.
+//   approved    — decided on GITHUB, not on Shortcut's review_status, because
+//                 this repo needs TWO approvals and Shortcut flips to "approved"
+//                 after the first. Clears when the PR is fully approved OR when
+//                 YOU have approved it. See filterUnapprovedOnGitHub.
 //   merged/closed/draft — nothing to review on any of those.
 //   own branch  — see MY_BRANCH_PREFIX.
 //
@@ -832,50 +913,144 @@ async function shortcut<T>(path: string, body?: unknown): Promise<T> {
 
 // Team + workflow-state ids, looked up once per process from their configured NAMES.
 // Both are workspace configuration that doesn't change while the widget runs.
-let scIds: { groupId: string; stateId: number } | null = null;
+let scIds: { groupId: string; stateIds: number[] } | null = null;
 
-async function resolveScIds(): Promise<{ groupId: string; stateId: number } | null> {
+// Collects EVERY state matching those names, across every workflow — it does not
+// stop at the first hit. The workspace has two states that trim to "Ready for
+// Review": one in Delivery and one in Data (the Data one has a trailing space).
+// A first-match-wins lookup silently binds to whichever workflow the API happens
+// to list first, which is a wrong answer that looks exactly like a right one.
+async function resolveScIds(): Promise<{ groupId: string; stateIds: number[] } | null> {
   if (scIds) return scIds;
   const groups = await shortcut<{ id: string; name: string; archived: boolean }[]>("/groups");
   const group = groups.find((g) => !g.archived && g.name === SC_TEAM_NAME);
   if (!group) return null;
 
   const workflows = await shortcut<{ states: { id: number; name: string }[] }[]>("/workflows");
-  for (const w of workflows) {
-    const state = w.states.find((s) => s.name.trim() === SC_REVIEW_STATE_NAME);
-    if (state) {
-      scIds = { groupId: group.id, stateId: state.id };
-      return scIds;
-    }
-  }
-  return null;
+  const stateIds = workflows.flatMap((w) =>
+    w.states.filter((s) => SC_REVIEW_STATE_NAMES.includes(s.name.trim())).map((s) => s.id),
+  );
+  if (!stateIds.length) return null;
+
+  scIds = { groupId: group.id, stateIds };
+  return scIds;
 }
 
-// Story id → the badges it produced, keyed on the story's updated_at, so an unchanged
-// story skips its detail fetch entirely (same trick as prBadgeCache).
-const scStoryCache = new Map<number, { updatedAt: string; badges: Badge[] }>();
+// Story id → the CANDIDATE PRs it contributed, keyed on the story's updated_at,
+// so an unchanged story skips its detail fetch entirely (same trick as
+// prBadgeCache).
+//
+// Candidates, not finished badges — and that distinction is the fix for a real
+// bug. Whether a PR still needs review is decided on GITHUB (see the block
+// below), and a GitHub approval does not move a Shortcut story's updated_at.
+// Caching the finished badge meant an approval could land and the badge would
+// sit there until something unrelated touched the ticket.
+const scStoryCache = new Map<number, { updatedAt: string; prs: TeamReviewCandidate[] }>();
+
+interface TeamReviewCandidate {
+  prNumber: number;
+  url: string;
+  repo: string;
+  updatedAt: string;
+}
+
+// ---- the approval gate ----
+//
+// This does NOT use Shortcut's `review_status`, and that is deliberate.
+//
+// Popmenu/popmenu requires TWO approvals. Shortcut flips `review_status` to
+// "approved" on the FIRST one, so it reports "somebody approved this", not "this
+// PR is done being reviewed" — those are different facts and only the second one
+// belongs in a review queue. Measured live: PR #35714 read `approved` in Shortcut
+// while GitHub still said REVIEW_REQUIRED, so it vanished from this panel while
+// it was in fact waiting on a second reviewer. Exactly backwards.
+//
+// GitHub's `reviewDecision` is the branch-protection verdict itself, so it counts
+// required reviewers, CODEOWNERS and dismissed-stale-review rules for free.
+// One aliased query for every candidate, uncached — an approval is precisely the
+// event we must not miss, so paying ~1 point per open team PR per poll is the
+// point rather than an oversight.
+//
+// TWO conditions clear a badge, because "the team still needs a review" and "I
+// still need to review" are different questions and this panel asks the second:
+//   reviewDecision === APPROVED    the PR is fully reviewed, nobody need act.
+//   viewerLatestReview APPROVED    YOU already approved it. Under a two-approval
+//     requirement your approval leaves reviewDecision at REVIEW_REQUIRED, so
+//     without this clause a PR you had just signed off on would sit in your queue
+//     until a second reviewer turned up — precisely backwards.
+// `viewerLatestReview` is GitHub resolving "your latest review" itself, so it
+// needs no login constant and already handles a later CHANGES_REQUESTED
+// superseding an earlier approval.
+async function filterUnapprovedOnGitHub(
+  candidates: TeamReviewCandidate[],
+): Promise<{ kept: TeamReviewCandidate[]; errors: string[] }> {
+  if (!candidates.length) return { kept: [], errors: [] };
+
+  const query = `query {
+    ${candidates
+      .map((c, i) => {
+        const [owner, repo] = c.repo.split("/");
+        return `p${i}: repository(owner: "${owner}", name: "${repo}") { pullRequest(number: ${c.prNumber}) { reviewDecision viewerLatestReview { state } } }`;
+      })
+      .join("\n")}
+    rateLimit { cost remaining limit resetAt }
+  }`;
+
+  let data: Record<string, unknown>;
+  try {
+    data = await ghGraphQL<Record<string, unknown>>(query, {});
+  } catch (err) {
+    // Fail OPEN: if GitHub can't be reached, show the badges rather than
+    // silently emptying the category. A stale 🤝 is a wasted click; a missing
+    // one is a PR nobody looks at.
+    return { kept: candidates, errors: [`team review decision: ${(err as Error).message}`] };
+  }
+
+  const rl = data.rateLimit as RateLimitInfo | null;
+  if (rl) lastKnownRateLimit = rl;
+
+  const kept = candidates.filter((c, i) => {
+    const node = data[`p${i}`] as {
+      pullRequest: { reviewDecision: string | null; viewerLatestReview: { state: string } | null } | null;
+    } | null;
+    const pr = node?.pullRequest;
+    // A null decision means the repo has no review requirement at all — nothing
+    // is gating it, so nothing marks it reviewed either. Keep it.
+    if (pr?.reviewDecision === "APPROVED") return false;
+    if (pr?.viewerLatestReview?.state === "APPROVED") return false;
+    return true;
+  });
+  return { kept, errors: [] };
+}
 
 async function fetchTeamReviewBadges(): Promise<{ badges: Badge[]; errors: string[] }> {
   const badges: Badge[] = [];
   const errors: string[] = [];
   if (!SHORTCUT_TOKEN) return { badges, errors };
 
-  let ids: { groupId: string; stateId: number } | null;
+  let ids: { groupId: string; stateIds: number[] } | null;
   try {
     ids = await resolveScIds();
   } catch (err) {
     return { badges, errors: [`shortcut ids: ${(err as Error).message}`] };
   }
   if (!ids) {
-    return { badges, errors: [`shortcut: no team "${SC_TEAM_NAME}" / state "${SC_REVIEW_STATE_NAME}"`] };
+    return { badges, errors: [`shortcut: no team "${SC_TEAM_NAME}" / states ${SC_REVIEW_STATE_NAMES.join(", ")}`] };
   }
 
+  // One search per state — the search endpoint takes a single workflow_state_id.
+  // Deduped by story id because a story can only be in one state, but a state id
+  // could in principle repeat across workflows.
   let stories: ScStory[];
   try {
-    stories = await shortcut<ScStory[]>("/stories/search", {
-      group_id: ids.groupId,
-      workflow_state_id: ids.stateId,
-    });
+    const perState = await Promise.all(
+      ids.stateIds.map((stateId) =>
+        shortcut<ScStory[]>("/stories/search", { group_id: ids!.groupId, workflow_state_id: stateId }),
+      ),
+    );
+    const byId = new Map<number, ScStory>();
+    for (const s of perState.flat()) byId.set(s.id, s);
+    stories = [...byId.values()];
   } catch (err) {
     return { badges, errors: [`shortcut search: ${(err as Error).message}`] };
   }
@@ -883,49 +1058,59 @@ async function fetchTeamReviewBadges(): Promise<{ badges: Badge[]; errors: strin
   // The one filter that isn't obvious — see the comment above.
   const live = stories.filter((s) => !s.archived);
 
+  const candidates: TeamReviewCandidate[] = [];
   const seenPrs = new Set<number>(); // one story's PR can be attached to another's
+
   for (const story of live) {
     const cached = scStoryCache.get(story.id);
+    let storyPrs: TeamReviewCandidate[];
+
     if (cached && cached.updatedAt === story.updated_at) {
-      for (const b of cached.badges) {
-        if (!seenPrs.has(b.prNumber)) {
-          seenPrs.add(b.prNumber);
-          badges.push(b);
-        }
+      storyPrs = cached.prs;
+    } else {
+      let detail: { pull_requests?: ScPullRequest[] };
+      try {
+        detail = await shortcut(`/stories/${story.id}`);
+      } catch (err) {
+        errors.push(`sc-${story.id}: ${(err as Error).message}`);
+        continue;
       }
-      continue;
-    }
 
-    let detail: { pull_requests?: ScPullRequest[] };
-    try {
-      detail = await shortcut(`/stories/${story.id}`);
-    } catch (err) {
-      errors.push(`sc-${story.id}: ${(err as Error).message}`);
-      continue;
-    }
-
-    const storyBadges: Badge[] = [];
-    for (const pr of detail.pull_requests ?? []) {
-      if (pr.merged || pr.closed || pr.draft) continue;
-      if (pr.review_status === "approved") continue;
-      if ((pr.branch_name ?? "").startsWith(MY_BRANCH_PREFIX)) continue;
-      const repoMatch = pr.url.match(/github\.com\/([^/]+\/[^/]+)\/pull\//);
-      storyBadges.push({
-        icon: TEAM_REVIEW_ICON,
-        url: pr.url,
-        createdAt: pr.updated_at ?? story.updated_at,
-        repo: repoMatch ? repoMatch[1] : "",
-        prNumber: pr.number,
-      });
-    }
-
-    scStoryCache.set(story.id, { updatedAt: story.updated_at, badges: storyBadges });
-    for (const b of storyBadges) {
-      if (!seenPrs.has(b.prNumber)) {
-        seenPrs.add(b.prNumber);
-        badges.push(b);
+      storyPrs = [];
+      for (const pr of detail.pull_requests ?? []) {
+        // Everything here is a property of the PR itself, cheap and stable —
+        // unlike approval state, which is why it is gated on GitHub below.
+        if (pr.merged || pr.closed || pr.draft) continue;
+        if ((pr.branch_name ?? "").startsWith(MY_BRANCH_PREFIX)) continue;
+        const repoMatch = pr.url.match(/github\.com\/([^/]+\/[^/]+)\/pull\//);
+        storyPrs.push({
+          prNumber: pr.number,
+          url: pr.url,
+          repo: repoMatch ? repoMatch[1] : "",
+          updatedAt: pr.updated_at ?? story.updated_at,
+        });
       }
+      scStoryCache.set(story.id, { updatedAt: story.updated_at, prs: storyPrs });
     }
+
+    for (const c of storyPrs) {
+      if (seenPrs.has(c.prNumber)) continue;
+      seenPrs.add(c.prNumber);
+      candidates.push(c);
+    }
+  }
+
+  const { kept, errors: gateErrors } = await filterUnapprovedOnGitHub(candidates.filter((c) => c.repo));
+  errors.push(...gateErrors);
+
+  for (const c of kept) {
+    badges.push({
+      icon: TEAM_REVIEW_ICON,
+      url: c.url,
+      createdAt: c.updatedAt,
+      repo: c.repo,
+      prNumber: c.prNumber,
+    });
   }
 
   return { badges, errors };
@@ -1097,9 +1282,49 @@ function clusterText(cluster: PRCluster): string {
 
 // one line per PR, always — keep the newest N if there isn't enough
 // vertical room for all of them
+// The pane is only as tall as tmux made it, so the oldest clusters fall off the
+// top. Pulled out of packClusters because the PR list written for `termdash
+// open-prs` has to be EXACTLY what is on screen — "open all the PRs in the pane"
+// is a lie if it also opens three you cannot see.
+function keptClusters(clusters: PRCluster[], maxRows: number): PRCluster[] {
+  return clusters.length > maxRows ? clusters.slice(clusters.length - maxRows) : clusters;
+}
+
 function packClusters(clusters: PRCluster[], maxRows: number): string[] {
-  const kept = clusters.length > maxRows ? clusters.slice(clusters.length - maxRows) : clusters;
-  return kept.map(clusterText);
+  return keptClusters(clusters, maxRows).map(clusterText);
+}
+
+// What is on screen right now, one PR url per line, for `termdash open-prs`
+// (prefix + O) to hand to the browser.
+//
+// Written on every paint rather than resolved when the key is pressed, for the
+// same reason the Herdr popup's link list is: the pane already knows, and a
+// keypress that has to go and ask GitHub first does not feel like a keypress.
+// The PR url, not the badge's url — the badge deep-links to one comment, and
+// "open the PR" means the PR.
+const PR_LIST_PATH = path.join(os.homedir(), ".cache", "termdash", "notiql-prs.txt");
+
+// The click target for the ⧉ below. An APP, not the script, because an OSC-8
+// hyperlink carries a URI and LaunchServices will launch an app but only ever
+// *open* a .sh in an editor — the same constraint build-ssh-app.sh and the
+// Activity Monitor cells in local-status.ts work around. Built by
+// ./build-open-prs-app.sh; if it is missing the ⧉ simply does not draw.
+const OPEN_PRS_APP = path.join(os.homedir(), "Applications", "Open PRs.app");
+
+function fileUrl(p: string): string {
+  return "file://" + p.split("/").map(encodeURIComponent).join("/");
+}
+
+function writePrList(clusters: PRCluster[]): void {
+  try {
+    fs.mkdirSync(path.dirname(PR_LIST_PATH), { recursive: true });
+    const body = clusters.map((c) => `https://github.com/${c.repo}/pull/${c.prNumber}`).join("\n");
+    // Truncating to empty matters: an empty pane must clear the list, or O would
+    // reopen whatever was on screen the last time there was anything.
+    fs.writeFileSync(PR_LIST_PATH, body ? `${body}\n` : "");
+  } catch {
+    /* the pane's job is the badges; a failed write costs the shortcut, not the frame */
+  }
 }
 
 function render(badges: Badge[], err: Error | null, fetchErrors: string[] = []): void {
@@ -1120,17 +1345,29 @@ function render(badges: Badge[], err: Error | null, fetchErrors: string[] = []):
   // ones — likely tmux not fully resetting OSC8 hyperlink cell-state
   // between frames when content shifts position. Don't reorder this again
   // without re-testing carefully.
+  let onScreen: PRCluster[] = [];
   if (badges.length === 0) {
     console.log(`${DIM}no pending replies${RESET}`);
   } else {
-    const clusters = groupByPR(badges);
-    const lines = packClusters(clusters, badgeRows);
-    for (const l of lines) console.log(l);
+    onScreen = keptClusters(groupByPR(badges), badgeRows);
+    for (const l of onScreen.map(clusterText)) console.log(l);
   }
 
   if (fetchErrors.length > 0) {
     console.log(`${RED}⚠ ${fetchErrors.length} fetch error(s) — try --debug${RESET}`);
+  } else if (onScreen.length > 1 && fs.existsSync(OPEN_PRS_APP)) {
+    // Rides in the row render() already holds back for an error line, so it costs
+    // no badge row — and it yields that row the moment there IS an error, because
+    // a convenience must not push a failure off the pane.
+    //
+    // Only from two PRs up: at one, the badge beside it already does this.
+    console.log(
+      `${LINK_BLUE}${link(`⧉ open all ${onScreen.length}`, fileUrl(OPEN_PRS_APP))}${RESET}`,
+    );
   }
+
+  // After the paint, never before: see the badges-print-first note above.
+  writePrList(onScreen);
 }
 
 async function loop(): Promise<void> {
@@ -1140,6 +1377,10 @@ async function loop(): Promise<void> {
   } catch (err) {
     render([], err as Error);
   }
+  // AFTER the paint and deliberately not awaited — see warmCommentSummaries.
+  // The pane's job is the badges; filling the summary cache for the brief is a
+  // side effect that must never delay a frame or the next poll.
+  void warmCommentSummaries();
   setTimeout(loop, POLL_SECONDS * 1000);
 }
 
