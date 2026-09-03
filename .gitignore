@@ -17,3 +17,11 @@ node_modules/
 
 # macOS
 .DS_Store
+
+# Compiled EventKit helper — rebuild with ./build-nextmeeting.sh
+bin/nextmeeting
+
+# Timestamped backups left by in-place edits (foo.ts.bak.<stamp>). Point-in-time
+# copies of files already tracked here.
+*.bak
+*.bak.*
