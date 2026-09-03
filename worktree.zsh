@@ -15,7 +15,6 @@
 #   git                  (required)
 #   gh                   (required for `worktree clean`; optional for `rm` — used
 #                         only to report merged/unmerged in the confirmation)
-#   cursor CLI           (optional — opens the new worktree in a Cursor window)
 #   bundle / yarn        (optional — auto-installs deps if a Gemfile/package.json
 #                         is present; safe no-op otherwise)
 #
@@ -23,9 +22,11 @@
 # docs/plans symlinks, bundle/yarn install) are tailored to the popmenu repo but
 # are all guarded by existence checks, so they simply skip in other repos.
 
-# Create/attach a git worktree in a sibling <repo>-worktrees/ dir, cd into it,
-# and open it in a new Cursor window.
-#   worktree -b steele/migrate-shortcut   # new branch off origin's default
+# Create/attach a git worktree in a sibling <repo>-worktrees/ dir and cd into it.
+#   worktree -b steele/migrate-shortcut   # new branch off origin's default branch
+#                                         #   (master, for popmenu), re-resolved
+#                                         #   from the remote and freshly fetched;
+#                                         #   aborts rather than fork off a stale base
 #   worktree steele/migrate-shortcut      # existing (local or remote) branch
 #   worktree clean [-y]                   # remove ALL worktrees whose PR has merged
 #   worktree rm                           # remove the worktree you're IN (merged or
@@ -34,10 +35,23 @@
 worktree() {
   if [[ "$1" == "clean" ]]; then shift; _worktree_clean "$@"; return $?; fi
   if [[ "$1" == "rm" || "$1" == "remove" ]]; then shift; _worktree_rm "$@"; return $?; fi
-  local create=0 branch
-  if [[ "$1" == "-b" ]]; then create=1; branch="$2"; else branch="$1"; fi
+  if [[ "$1" == "install" ]]; then shift; _worktree_install "$@"; return $?; fi
+  # --no-install splits creation into its fast half (checkout + provisioning,
+  # seconds) and its slow half (node pin + bundle + yarn, minutes). Herdr's
+  # prefix+shift+N binding uses it so the popup can close as soon as the
+  # checkout exists, then run `worktree install` in the new Space's own zsh
+  # pane where the output is visible and nothing is modal. Order-independent,
+  # so `-b foo --no-install` and `--no-install -b foo` both work.
+  local create=0 install=1 branch
+  while (( $# )); do
+    case "$1" in
+      -b)          create=1; branch="$2"; shift 2 ;;
+      --no-install) install=0; shift ;;
+      *)           branch="$1"; shift ;;
+    esac
+  done
   if [[ -z "$branch" ]]; then
-    echo "usage: worktree [-b] <branch>" >&2
+    echo "usage: worktree [-b] [--no-install] <branch>" >&2
     return 1
   fi
 
@@ -59,12 +73,52 @@ worktree() {
   fi
   mkdir -p "${dir:h}" # git worktree add won't create missing parent dirs
 
-  git -C "$root" fetch --quiet origin 2>/dev/null
+  # A new branch is only as current as the last fetch, so a FAILED fetch is not a
+  # cosmetic problem — it silently forks you off whatever master looked like the
+  # last time this machine was online, and you find out at rebase time. It used to
+  # be `2>/dev/null` with no status check, which hid exactly that.
+  #
+  # Hard error for -b, warning otherwise: creating a branch is the case where the
+  # base commit matters, whereas checking out an existing branch you already have
+  # locally is a reasonable thing to do on a plane.
+  if ! git -C "$root" fetch --quiet origin; then
+    if (( create )); then
+      echo "worktree: git fetch failed — refusing to branch off a possibly stale base" >&2
+      return 1
+    fi
+    echo "worktree: git fetch failed — continuing with local refs" >&2
+  fi
 
   if (( create )); then
+    # refs/remotes/origin/HEAD is a LOCAL pointer written once at clone time. If
+    # the repo's default branch is ever renamed it keeps naming the old one
+    # indefinitely, and every new branch would quietly fork from a branch nobody
+    # merges into any more. --auto re-reads it from the remote, so the answer is
+    # the remote's, not this clone's memory of it. Side benefit: it repairs the
+    # ref for every other tool that reads it.
+    git -C "$root" remote set-head origin --auto >/dev/null 2>&1
+
     local base
     base=$(git -C "$root" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) \
-      || base="origin/master"
+      || base=$(git -C "$root" ls-remote --symref origin HEAD 2>/dev/null \
+                | sed -n 's#^ref: refs/heads/\(.*\)\tHEAD$#origin/\1#p')
+    # Last resort. Only reached with no origin/HEAD and no network; naming the
+    # guess out loud beats forking off something unexpected in silence.
+    if [[ -z "$base" ]]; then
+      base="origin/master"
+      echo "worktree: could not resolve origin's default branch, assuming $base" >&2
+    fi
+
+    # `worktree add` would report this itself, but its error names the ref without
+    # explaining that the ref is the thing this function chose for you.
+    if ! git -C "$root" rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+      echo "worktree: base ref '$base' does not exist locally — try: git -C $root fetch origin" >&2
+      return 1
+    fi
+
+    # Print the base, and the commit. "Make sure it branches off master" is only
+    # believable if you can see which master it used.
+    echo "worktree: branching $branch off $base ($(git -C "$root" log -1 --format='%h %s' "$base" | cut -c1-72))"
     git -C "$root" worktree add -b "$branch" "$dir" "$base" || return 1
   else
     git -C "$root" worktree add "$dir" "$branch" || return 1
@@ -95,23 +149,10 @@ worktree() {
     cp -p "$root/.bundle/config" "$dir/.bundle/config"
   fi
 
-  # Pin node to the version this repo asks for (popmenu: 24.14.0) BEFORE any
-  # install runs — yarn install compiles native modules against whatever node is
-  # active, so installing under the wrong one silently poisons node_modules.
-  # Done here in the function body (not a subshell) so the version also sticks in
-  # your shell once we cd into the worktree below.
-  _worktree_node_version "$dir" "$root"
-
-  # Install deps in the new tree. Non-fatal: a failed install still leaves a
-  # usable checkout, and the error stays visible for you to rerun by hand.
-  if [[ -f "$dir/Gemfile" ]] && command -v bundle >/dev/null; then
-    echo "worktree: bundle install…"
-    ( cd "$dir" && bundle install )
-  fi
-  if [[ -f "$dir/package.json" ]] && command -v yarn >/dev/null; then
-    echo "worktree: yarn install…"
-    ( cd "$dir" && yarn install )
-  fi
+  # The slow half. Skipped by --no-install, which leaves a complete, usable
+  # checkout that simply has no node_modules/gems yet — run `worktree install`
+  # in it to finish.
+  (( install )) && _worktree_install "$dir" "$root"
 
   # Share the planning docs. docs/plans is a tracked dir (docs/plans/.keep) whose
   # contents are gitignored and live only in the main checkout — so symlink each
@@ -151,11 +192,54 @@ worktree() {
   fi
 
   cd "$dir"
-  # Open the worktree in Cursor. Plain `cursor <folder>` opens a NEW window for a
-  # folder that isn't already open (which every fresh worktree is) — and unlike
-  # `cursor -n`, it reliably attaches the folder instead of racing to an empty
-  # "select a project" window on cold start.
-  command -v cursor >/dev/null && cursor "$dir"
+}
+
+# Install a worktree's dependencies: the slow half of `worktree -b`.
+#   worktree install              # the worktree you're in
+#   worktree install <dir>        # a specific one
+#   _worktree_install <dir> <main-checkout>
+#
+# Split out of the create path so `worktree -b --no-install` can hand this to a
+# terminal you can actually watch. Herdr's prefix+shift+N does exactly that: the
+# popup returns as soon as the checkout is provisioned, and this runs in the new
+# Space's zsh pane. Also useful on its own after a `yarn.lock` change or when a
+# create-time install failed.
+#
+# Idempotent, and non-fatal throughout: a failed install still leaves a usable
+# checkout with the error on screen to rerun by hand. Repos without a
+# Gemfile/package.json simply skip.
+#
+# MUST run in an interactive shell that has loaded nvm.sh — _worktree_node_version
+# is a no-op otherwise (nvm is a shell function, not a binary), and yarn would
+# then compile native modules against whatever node happens to be active.
+_worktree_install() {
+  local dir="${1:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+  if [[ -z "$dir" || ! -d "$dir" ]]; then
+    echo "worktree install: not inside a git worktree (and no dir given)" >&2
+    return 1
+  fi
+
+  # The main checkout, for the .nvmrc fallback. --git-common-dir points at the
+  # ONE real .git dir shared by every linked worktree, so its parent is the main
+  # checkout no matter which worktree we were called from. `git rev-parse
+  # --show-toplevel` would just hand back $dir again.
+  local fallback="${2}"
+  if [[ -z "$fallback" ]]; then
+    local common
+    common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+    [[ -n "$common" ]] && fallback="${common:h}"
+  fi
+
+  _worktree_node_version "$dir" "$fallback"
+
+  if [[ -f "$dir/Gemfile" ]] && command -v bundle >/dev/null; then
+    echo "worktree: bundle install…"
+    ( cd "$dir" && bundle install )
+  fi
+  if [[ -f "$dir/package.json" ]] && command -v yarn >/dev/null; then
+    echo "worktree: yarn install…"
+    ( cd "$dir" && yarn install )
+  fi
 }
 
 # Switch nvm to the node version the repo pins, so the worktree's yarn install (and
