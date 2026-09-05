@@ -69,6 +69,19 @@ Trailing, ragged width cost nothing. Leading, it would shift the name column on
 every row whose agent state differed, so the slot is padded to the widest and the
 glyph centred in it.
 
+> **Widget panes run with `SPINNER_OFF=1`.** `~/.zsh-sources/spinner.zsh` paints a
+> braille spinner to `/dev/tty` while a foreground command runs — and every widget
+> here *is* a foreground command that never exits, so its painter stayed alive for
+> the life of the dashboard: ~0.8% CPU per pane, stamping braille over the widget's
+> own output 12× a second, and past the spinner's 60s full-width stage doing it at
+> `COLUMNS-2` — a 55-cell wave across a 57-column pane. `SPINNER_SKIP` can't catch
+> it by name and the spinner's raw-mode check can't either, because a program that
+> only writes ANSI never leaves canonical mode; it looks exactly like a slow build.
+> `up()` sets the variable via `split-window -e` (see `PANE_ENV`) on the five widget
+> panes only — the middle pane is an ordinary prompt and keeps its spinner. It has
+> to be pane *environment*, not `VAR=1 cmd`: `preexec` runs in the parent shell
+> before the command line executes, so a variable set on that line is set too late.
+
 There is deliberately no CI/agent tally under the rows. Both counts restated what
 the rows already show — every `●` and every agent glyph is on screen directly
 above — and they cost three rows (two tallies plus the rule dividing them off) in
@@ -301,9 +314,59 @@ term-dash is this worktree panel plus a few sibling widgets, tiled by the
   Centering rather than left-packing is what makes that work: the alert lands mid-screen
   no matter how wide the terminal is or how long the vitals happen to render. It reads as
   a ranked alert ticker: with no meeting imminent and nothing expiring or dead the center
-  is simply empty, so the only reason to look mid-strip is that something wants you. An empty middle is not taken as
+  has nothing to say, so the only reason to look mid-strip is that something wants you. An empty middle is not taken as
   proof of health on its own — a missing cache shows a dim `KEYS ?`, and a `key-check`
   agent that stopped refreshing says so outright past `KEYCHECK_STALE_HOURS`.
+
+  **The gap between the two ends is a wave.** Every blank cell between the clock block
+  and the machine block carries the same braille animation `~/.zsh-sources/spinner.zsh`
+  draws at the prompt — same maths, same colour stops, so it reads as the same object.
+  It is a background, not a segment: its width is whatever the two ends leave over, and
+  it reflows on its own as the vitals grow and shrink.
+
+  **Alerts sit on top of it.** A terminal cell holds one glyph, so "behind the text"
+  cannot mean the wave and the letter share a cell — it means the wave owns every cell
+  the text does not. The alert keeps its own colour and gets a blank gutter each side,
+  so it reads as sitting *on* the wave rather than tangled in it:
+
+  ```
+  10:17 AM  Fri Sep 4 ⠉⠢⣀⠤⠤⠒⠊⠑⢄⡠⠤⠔⠒⠉⠢⣀⠤⠤⠒⠊⠑⢄⡠⠤⠔ ◷ in 12m — The Marketeers Standup ⠤⠒⠒⠉⠢⣀⠤⠔⠒⠊⠑⢄⡠⠤⠒⠒⠉⠢⣀⠤ CPU 25%  MEM 62%
+  ```
+
+  Compositing is why the frame cache holds **one string per cell** rather than one per
+  frame — a joined frame is a soup of colour escapes with no boundary you can safely cut
+  on. A `RESET` goes in before the leading gutter or the last wave cell's colour bleeds
+  into the blank and the alert looks like it has a coloured shadow; the trailing side
+  needs none, since the next wave cell opens with its own escape.
+
+  The alert is centred **on the line, not in the gap** — the overlay is handed the screen
+  column the wave starts at and the full strip width, not just the cell array. Centring
+  within the array is the obvious thing and it is wrong for exactly the reason
+  `layoutStrip` spells out: the two ends are different lengths (a ~20-cell clock block
+  against a ~50-cell machine block), so the gap's midpoint sits some 15 columns left of
+  the line's and the alert visibly drifts. Verified against the old path — with room to
+  move, `TERMDASH_IDLE_WAVE=0` and `=1` put the alert on identical columns. Where the
+  alert nearly fills the gap both clamp instead, and the wave version lands within a
+  column of the plain one.
+
+  Widening genuinely adds wave rather than stretching it: the wavelength is pinned in
+  *samples*, not scaled to the width, so 32 cells shows ~5 cycles and 105 shows ~16.
+  One cell of air is held back at each end so the wave never abuts the clock or the CPU
+  readout.
+
+  This is not the thing that gets turned off in the widget panes, and the difference is
+  what makes it safe. That spinner was a separate process painting over a pane it did
+  not own, at the cursor, blind to what was underneath. This is part of a line this
+  process already redraws in full every frame — there is nothing to smear onto. All 52
+  frames (4 shapes × 13 phases) are precomputed per width, so the lane measures **0.00s
+  of CPU per 10s** even repainting at 12.5fps all day; the shell painter cost ~0.06s per
+  10s per pane recomputing `sin()` in shell arithmetic.
+
+  The lane no longer stands down while an alert is up — with the wave as the background,
+  stopping would freeze it around a live alert, which looks broken rather than calm.
+  `TERMDASH_IDLE_WAVE=0` turns the whole thing off and restores the plain empty centre.
+  See it in a still frame with `npx tsx local-status.ts --mock --idle`, or with an alert
+  on it via `--mock --mins=12`.
 
   On the left, `◷ 18m Standup` is your next meeting — a countdown rather than a clock
   time, because there is already a clock two segments over and what you want off a

@@ -75,6 +75,9 @@
  *   npx tsx local-status.ts --mock --imminent
  *     Same, but with the meeting 2 minutes out, so the center hands over from
  *     KEYS to the meeting and both alerts compete for the budget.
+ *   npx tsx local-status.ts --mock --idle
+ *     No alerts at all, so the centre is empty and the idle wave has the space.
+ *     TERMDASH_IDLE_WAVE=0 with the same flag shows the plain empty centre.
  *   npx tsx local-status.ts --mock --mins=12
  *     An arbitrary countdown. The two canned values (18 and 2) sit either side
  *     of the alert window, so this is the only way to land ON the
@@ -839,6 +842,175 @@ function rankAlerts(v: Vitals): Segment[] {
   return out;
 }
 
+// ---- idle wave: the spinner, parked in the empty centre --------------------
+//
+// The centre is the alert channel, and most of the day it has nothing to say. So
+// when it is empty it gets the braille wave from ~/.zsh-sources/spinner.zsh
+// instead — same maths, same gruvbox-material colour stops, so it reads as the
+// same object you get at the prompt.
+//
+// This is NOT the thing that was just turned off in the widget panes, and the
+// difference is what makes it safe. That spinner was a SEPARATE process painting
+// over a pane it did not own, at the cursor, with no way to know what was
+// underneath it. This is one segment of a line this process already redraws in
+// full every frame — it cannot smear, because there is nothing to smear onto.
+//
+// It also inverts the meaning, deliberately. At the prompt the wave means "still
+// working". Here it means the opposite: motion is the idle state, and the moment
+// there is anything to tell you the wave is REPLACED by the alert. Movement
+// stopping is itself the signal.
+//
+// TERMDASH_IDLE_WAVE=0 turns it off; the centre then stays blank as before.
+const IDLE_WAVE = process.env.TERMDASH_IDLE_WAVE !== "0";
+// The wave FILLS the gap — every blank cell between the clock block and the
+// machine block — rather than sitting in it at a fixed width. It is a background
+// now, not a segment, so its width is whatever the two ends leave over and it
+// reflows on its own as the vitals grow and shrink.
+//
+// Widening genuinely adds wave rather than stretching it. The wavelength is
+// pinned in SAMPLES (IDLE_WAVE_LEN), not scaled to the width, so 32 cells shows
+// ~5 cycles and 105 shows ~16 — the same lesson spinner.zsh records after its
+// wave went flat when frequency was "one cycle across the width".
+//
+// One cell of air is held back at each end so the wave never abuts the clock or
+// the CPU readout, which would read as the two colliding.
+const IDLE_WAVE_MARGIN = 1;
+const IDLE_WAVE_MIN = 8; // narrower than this reads as noise, so draw nothing
+// 80ms = spinner.zsh's SPINNER_INTERVAL of 8 hundredths. Matching it matters:
+// side by side at different rates they look like two different animations.
+const IDLE_WAVE_INTERVAL_MS = 80;
+const IDLE_WAVE_LEN = 13; // samples per cycle (~6.5 cells), pinned so widening adds wave
+const IDLE_WAVE_SHAPES = 4;
+const IDLE_WAVE_SHAPE_HOLD = 25; // frames per shape (spinner.zsh: 200/8)
+const IDLE_WAVE_STOPS = ["d8a657", "a9b665", "89b482", "7daea3", "d3869b"];
+
+// A braille cell is a 2x4 dot matrix: 2 horizontal samples, 4 vertical levels.
+// The bitmasks are NOT in reading order — left column top-to-bottom is dots
+// 1,2,3,7 and right is 4,5,6,8, hence 64/128 at the end. Char = U+2800 + bits.
+const IDLE_L_MASK = [1, 2, 4, 64];
+const IDLE_R_MASK = [8, 16, 32, 128];
+
+let waveRamp: string[] | null = null;
+
+// The colour stops interpolated to a 24-entry ramp, indexed by (cell + phase) so
+// the gradient travels WITH the wave instead of sitting still underneath it.
+function idleRamp(): string[] {
+  if (waveRamp) return waveRamp;
+  const n = 24;
+  const N = IDLE_WAVE_STOPS.length;
+  const hex = (h: string, i: number) => parseInt(h.slice(i, i + 2), 16);
+  const out: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const t = (i * N) / n;
+    const seg = Math.floor(t);
+    const f = t - seg;
+    const a = IDLE_WAVE_STOPS[seg % N];
+    const b = IDLE_WAVE_STOPS[(seg + 1) % N];
+    const [r, g, bl] = [0, 2, 4].map((k) => Math.round(hex(a, k) + f * (hex(b, k) - hex(a, k))));
+    out.push(`\x1b[38;2;${r};${g};${bl}m`);
+  }
+  waveRamp = out;
+  return out;
+}
+
+// Height is two stacked harmonics, y = 0.65*sin(t) + 0.35*sin(2t + phi), with phi
+// rotating per shape to morph the waveform. The two terms are asymmetric, so each
+// shape is measured and stretched to the full cell height on its own — without
+// that, a shape whose trough is deeper than its crest never reaches the top row
+// and reads as flat.
+function idleRange(phi: number): [number, number] {
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let k = 0; k < IDLE_WAVE_LEN * 2; k++) {
+    const th = (Math.PI * k) / IDLE_WAVE_LEN;
+    const y = 0.65 * Math.sin(th) + 0.35 * Math.sin(2 * th + phi);
+    if (y < lo) lo = y;
+    if (y > hi) hi = y;
+  }
+  return [lo, hi];
+}
+
+// Returns ONE STRING PER CELL, not one string per frame. That is what lets an
+// alert be punched into the middle of the wave: compositing needs to address
+// cells, and a joined frame is a soup of colour escapes with no cell boundaries
+// you can safely cut on.
+function idleFrame(width: number, p: number, phi: number, lo: number, hi: number): string[] {
+  const ramp = idleRamp();
+  const span = Math.max(hi - lo, 0.001);
+  const level = (sample: number): number => {
+    const th = (2 * Math.PI * (sample - p)) / IDLE_WAVE_LEN;
+    const y = (2 * (0.65 * Math.sin(th) + 0.35 * Math.sin(2 * th + phi) - lo)) / span - 1;
+    return Math.min(3, Math.max(0, Math.round(((1 - y) / 2) * 3)));
+  };
+  const cells: string[] = [];
+  for (let c = 0; c < width; c++) {
+    const bits = IDLE_L_MASK[level(2 * c)] | IDLE_R_MASK[level(2 * c + 1)];
+    cells.push(ramp[(c + p) % ramp.length] + String.fromCodePoint(0x2800 + bits));
+  }
+  return cells;
+}
+
+// Every frame precomputed on first use at a given width — 4 shapes x 13 phases =
+// 52 strings. The wave repeats every IDLE_WAVE_LEN samples no matter how wide it
+// is, which is why widening costs no extra frames. Rebuilt only on a resize.
+let waveCache: { width: number; frames: string[][] } | null = null;
+
+function idleWave(width: number, frame: number): string[] {
+  if (!waveCache || waveCache.width !== width) {
+    const frames: string[][] = [];
+    for (let sh = 0; sh < IDLE_WAVE_SHAPES; sh++) {
+      const phi = (sh * 2 * Math.PI) / IDLE_WAVE_SHAPES;
+      const [lo, hi] = idleRange(phi);
+      for (let p = 0; p < IDLE_WAVE_LEN; p++) frames.push(idleFrame(width, p, phi, lo, hi));
+    }
+    waveCache = { width, frames };
+  }
+  const shape = Math.floor(frame / IDLE_WAVE_SHAPE_HOLD) % IDLE_WAVE_SHAPES;
+  return waveCache.frames[shape * IDLE_WAVE_LEN + (frame % IDLE_WAVE_LEN)];
+}
+
+// Punch `text` into the middle of a wave, wave continuing either side.
+//
+// A terminal cell holds one glyph, so "behind the text" cannot mean the wave and
+// the letter share a cell — it means the wave OWNS every cell the text does not.
+// The text keeps its own colour and gets a blank gutter each side, so the alert
+// reads as sitting on the wave rather than tangled in it.
+//
+// CENTRED ON THE LINE, NOT ON THE GAP, which is why this needs `col0` (the screen
+// column cells[0] occupies) and `lineWidth` rather than just the array. Centring
+// in the array is the obvious thing and it is wrong for the same reason
+// layoutStrip spells out: the two ends are different lengths — a ~20-cell clock
+// block against a ~50-cell machine block — so the gap's midpoint sits some 15
+// columns left of the line's, and the alert visibly drifts off centre. The eye is
+// already at the middle of the strip; that is the mark to hit.
+//
+// Clamped to the wave's own extent, so a long alert in a lopsided gap slides
+// rather than overhanging into the vitals.
+//
+// RESET before the gutter, because otherwise the last wave cell's colour bleeds
+// into the blank and the alert looks like it has a coloured shadow. The trailing
+// side needs none — the next wave cell opens with its own colour escape.
+function overlayOnWave(
+  cells: string[],
+  text: string,
+  col0: number,
+  lineWidth: number,
+  gutter = 1
+): string | null {
+  const span = visibleWidth(text) + gutter * 2;
+  if (span > cells.length) return null; // caller falls back to the plain layout
+  // Where layoutStrip would have put the text, in absolute screen columns.
+  const idealCol = Math.floor((lineWidth - visibleWidth(text)) / 2);
+  const start = Math.min(Math.max(idealCol - col0 - gutter, 0), cells.length - span);
+  const pad = " ".repeat(gutter);
+  return (
+    cells.slice(0, start).join("") +
+    RESET + pad + text + pad +
+    cells.slice(start + span).join("") +
+    RESET
+  );
+}
+
 // The winner always gets the space it needs, truncated if that is all there is.
 // A lower-ranked alert then tries its full wording, falls back to its compact
 // badge, and is dropped only if even that will not fit. What it never does is
@@ -947,9 +1119,12 @@ function pickVariants(lefts: string[], rights: string[], width: number): [string
   return [lefts[lefts.length - 1], rights[rights.length - 1]];
 }
 
-function render(v: Vitals): void {
+function render(v: Vitals, anim = false): void {
   lastVitals = v;
-  process.stdout.write("\x1b[3J\x1b[2J\x1b[H"); // clear scrollback + screen + home, not a full reset (\x1Bc)
+  // Full clear on a data tick; on an animation frame just home + erase-line.
+  // \x1b[3J asks the terminal to drop its scrollback, and doing that twelve times
+  // a second for a one-row pane is pure waste.
+  process.stdout.write(anim ? "\x1b[H" : "\x1b[3J\x1b[2J\x1b[H");
 
   const width = stripWidth();
   const [left, right] = pickVariants(buildLeftVariants(v), buildRightVariants(v), width);
@@ -960,9 +1135,51 @@ function render(v: Vitals): void {
   const budget = width - visibleWidth(left) - visibleWidth(right) - 2;
   const center = buildCenter(rankAlerts(v), budget);
 
+  // The wave is the BACKGROUND of the gap, so it is laid out here rather than
+  // handed to layoutStrip as a centred segment: it is not a segment, it is every
+  // cell the two ends did not claim. An alert is composited into it.
+  //
+  // Widths are exact by construction — left + margin + wave + margin + right ==
+  // width — which is what keeps the machine block flush right without
+  // layoutStrip's padding arithmetic getting involved.
+  let line: string | null = null;
+  if (IDLE_WAVE) {
+    const span = width - visibleWidth(left) - visibleWidth(right) - IDLE_WAVE_MARGIN * 2;
+    if (span >= IDLE_WAVE_MIN) {
+      const cells = idleWave(span, animFrame);
+      const filled = center
+        ? overlayOnWave(cells, center, visibleWidth(left) + IDLE_WAVE_MARGIN, width)
+        : cells.join("") + RESET;
+      // A center too wide to sit on the wave falls through to the plain layout,
+      // which knows how to truncate and, failing that, how to drop it.
+      if (filled !== null) {
+        const air = " ".repeat(IDLE_WAVE_MARGIN);
+        line = left + air + filled + air + right;
+      }
+    }
+  }
+
   // No trailing newline: in a 1-row pane a newline scrolls the line we just
-  // drew off the top.
-  process.stdout.write(layoutStrip(left, center, right, width));
+  // drew off the top. \x1b[K on animation frames because the light repaint does
+  // not clear, and layoutStrip's narrowest branch returns a short line.
+  process.stdout.write((line ?? layoutStrip(left, center, right, width)) + (anim ? "\x1b[K" : ""));
+}
+
+// Animation lane, same shape as the one in cursor-status.ts: re-render the cached
+// vitals on a fast tick.
+//
+// It used to stand down while an alert held the centre, on the grounds that an
+// alert is a thing to read rather than a thing to animate behind. Now that the
+// wave is the gap's background that is no longer an option — stopping would
+// freeze the background around a live alert, which looks broken rather than
+// calm. The alert still gets a blank gutter either side so nothing moves against
+// its edges, and TERMDASH_IDLE_WAVE=0 remains the way out.
+let animFrame = 0;
+
+function animate(): void {
+  animFrame++;
+  if (IDLE_WAVE && lastVitals) render(lastVitals, true);
+  setTimeout(animate, IDLE_WAVE_INTERVAL_MS);
 }
 
 async function loop(): Promise<void> {
@@ -1053,7 +1270,10 @@ if (process.argv.includes("--mock")) {
     // reflects real ranking, the +N tail and the compact badge. The literal it
     // replaced had drifted: it showed two names next to a "+1" that the actual
     // slice(0, 3) could never produce.
-    keys: describeKeys({
+    // --idle drops the key alert so the centre is empty, which is the only way to
+    // see the idle wave in a still frame — every other mock has something to say
+    // there, and the wave only appears when nothing does.
+    keys: process.argv.includes("--idle") ? { text: "", color: "" } : describeKeys({
       checked_at: new Date().toISOString(),
       worst: "failing",
       needs_attention: ["CIRCLECI_TOKEN"],
@@ -1080,4 +1300,5 @@ if (process.argv.includes("--mock")) {
     if (lastVitals) render(lastVitals);
   });
   loop();
+  animate();
 }
