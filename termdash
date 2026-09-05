@@ -56,6 +56,23 @@ RIGHT_WIDTH_PCT=15
 STATUS_HEIGHT=1
 STATUS_CMD="npx tsx local-status.ts"
 
+# Environment handed to the WIDGET panes only — every pane below is created with
+# it, and the middle pane deliberately is not (it comes from `new-session`).
+#
+# SPINNER_OFF turns off the braille spinner in ~/.zsh-sources/spinner.zsh. That
+# spinner paints to /dev/tty while a foreground command runs, and every widget
+# here IS a foreground command that never exits — so its painter stayed alive for
+# the life of the dashboard, burning ~0.8% CPU per pane and stamping braille over
+# the widget's own output twelve times a second. Past the spinner's 60s
+# full-width stage it does that at COLUMNS-2: a 55-cell wave across a 57-column
+# pane. The middle pane is an ordinary prompt and keeps its spinner, which is
+# where you actually want it.
+#
+# `-e` and not an `export` sent with send-keys: preexec runs in the shell BEFORE
+# the command line executes, so a variable set on that same line is set too late
+# to be seen. The pane's environment is the only place it can live.
+PANE_ENV="-e SPINNER_OFF=1"
+
 # worktrees panel — replaces the standalone circleci panel; CI status is folded
 # into each worktree row (colored ● dot), so this is now our CI-focused panel.
 LEFT_CMD="npx tsx cursor-status.ts"
@@ -360,20 +377,20 @@ up() {
   # window width. Every split after this one happens inside "remainder", which is
   # now the region below the strip — that is what keeps the columns from cutting
   # through it.
-  status_pane=$(tmux split-window -v -b -l "$STATUS_HEIGHT" -t "$remainder" \
+  status_pane=$(tmux split-window -v -b -l "$STATUS_HEIGHT" -t "$remainder" $PANE_ENV \
     -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
   tmux send-keys -t "$status_pane" "clear && $STATUS_CMD" Enter
 
   # peel the LEFT column off first (this pane keeps its id, shrinks to the
   # right, and becomes the middle pane once the right column is also peeled)
-  left_pane=$(tmux split-window -h -b -p "$LEFT_WIDTH_PCT" -t "$remainder" \
+  left_pane=$(tmux split-window -h -b -p "$LEFT_WIDTH_PCT" -t "$remainder" $PANE_ENV \
     -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
 
   # peel the RIGHT column off what's left. RIGHT_WIDTH_PCT is a fraction of
   # the TOTAL width, but at this point "remainder" is only (100-LEFT)% of
   # total — so convert to a percentage of the current remainder first.
   right_pct_of_remainder=$(( RIGHT_WIDTH_PCT * 100 / (100 - LEFT_WIDTH_PCT) ))
-  right_pane=$(tmux split-window -h -p "$right_pct_of_remainder" -t "$remainder" \
+  right_pane=$(tmux split-window -h -p "$right_pct_of_remainder" -t "$remainder" $PANE_ENV \
     -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
   # remainder is now the middle pane — deliberately left as a plain shell,
   # no command sent
@@ -381,7 +398,7 @@ up() {
   # left column, top→bottom: worktrees (remainder), peers (fixed, small). Same
   # shape as the right column — peel the fixed bottom pane off and let the top
   # one keep its id and take whatever height is left.
-  left_bottom=$(tmux split-window -v -l "$LEFT_BOTTOM_HEIGHT" -t "$left_pane" \
+  left_bottom=$(tmux split-window -v -l "$LEFT_BOTTOM_HEIGHT" -t "$left_pane" $PANE_ENV \
     -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
   tmux send-keys -t "$left_pane" "clear && $LEFT_CMD" Enter
   tmux send-keys -t "$left_bottom" "clear && $LEFT_BOTTOM_CMD" Enter
@@ -389,7 +406,7 @@ up() {
   # right column, top→bottom: git-notiql (remainder), Notion to-do (fixed,
   # small). Peel the fixed bottom pane off; right_pane keeps its id and stays
   # the top pane, taking whatever height is left over.
-  right_bottom=$(tmux split-window -v -l "$RIGHT_BOTTOM_HEIGHT" -t "$right_pane" \
+  right_bottom=$(tmux split-window -v -l "$RIGHT_BOTTOM_HEIGHT" -t "$right_pane" $PANE_ENV \
     -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
   tmux send-keys -t "$right_pane" "clear && $RIGHT_TOP_CMD" Enter
   tmux send-keys -t "$right_bottom" "clear && $RIGHT_BOTTOM_CMD" Enter
@@ -419,11 +436,29 @@ status() {
   fi
 }
 
+# `termdash up` brings the dashboard up in ITS OWN Kitty window on the Xeneon --
+# own geometry, own font size -- rather than taking over whatever terminal it was
+# typed in. cscode's bin/termdash-xeneon owns that window: a separate kitty
+# PROCESS plus kitty/xeneon.conf, because kitty keeps ONE global remembered
+# window size, so a second window in the same process cannot have its own.
+#
+# Guarded three ways so it can neither recurse nor hijack:
+#   * TERMDASH_IN_WINDOW is set by the launcher, so the inner call falls through
+#   * inside tmux we are already in a session; attach/switch as before
+#   * if the launcher is not installed, behave exactly as it always did
+XENEON_LAUNCHER="$HOME/.local/bin/termdash-xeneon"
+up_in_window() {
+  if [ -z "${TERMDASH_IN_WINDOW:-}" ] && [ -z "${TMUX:-}" ] && [ -x "$XENEON_LAUNCHER" ]; then
+    exec "$XENEON_LAUNCHER"
+  fi
+  up
+}
+
 cmd="${1:-}"
 case "$cmd" in
-  up) up ;;
+  up) up_in_window ;;
   down) down ;;
-  restart) down; sleep 0.3; up ;;
+  restart) down; sleep 0.3; up_in_window ;;
   status) status ;;
   brief) brief ;;
   brief-fresh) brief_fresh ;;
