@@ -1,0 +1,119 @@
+#!/bin/zsh
+# brief-open — put today's morning brief in front of you, in Chrome.
+#
+#   brief-open              open (or re-focus and reload) the brief now
+#   brief-open --if-unseen  the same, but only once a day (every day, weekends
+#                           included) and only after the 06:00 build. This is what
+#                           bin/unlock-watch runs on every screen unlock.
+#
+# FIND-OR-FOCUS, not `open`. `open file://…` would stack a new tab every
+# morning, and tabjump can't help: it deliberately ignores file:// URLs. So the
+# script below looks for a tab already showing today.html. If it finds one it
+# reloads it, selects it and raises its window; otherwise it opens a new tab in
+# the front window. Then it centres that window on the primary display and
+# activates Chrome, so the brief is literally front and centre.
+#
+# FIRST RUN: macOS will ask whether the calling process may control Google
+# Chrome (System Settings → Privacy & Security → Automation). Run
+# `./brief-open` once by hand from a terminal to answer that prompt, and expect
+# a second prompt naming unlock-watch the first time it fires on its own.
+
+set -euo pipefail
+
+DASH="${0:A:h}"
+CACHE="$HOME/.cache/termdash"
+TODAY="$(date +%F)"
+PAGE="$CACHE/brief/$TODAY.html"
+URL="file://$CACHE/brief/today.html"
+SEEN="$CACHE/brief-$TODAY.chrome-seen"
+
+if [[ "${1:-}" == "--if-unseen" ]]; then
+  [[ -e "$SEEN" ]] && exit 0
+  # Before 06:00 there is no today's brief yet. Building one here would show a
+  # brief that misses the last few hours of the night, and burn the day's .seen
+  # marker on it, so wait for the next unlock instead.
+  (( 10#$(date +%H) < 6 )) && exit 0
+fi
+
+# Mac asleep at 06:00 and launchd hasn't caught up yet, or the job failed: build
+# it now rather than showing yesterday's page. Slow (seconds), but only on
+# mornings that would otherwise show nothing.
+if [[ ! -e "$PAGE" ]]; then
+  "$DASH/morning-brief.ts" --write
+fi
+
+# WHICH Chrome. Playwright (the MCP browser, demos, tests) launches extra copies
+# of this same Google Chrome.app with a throwaway --user-data-dir: no cookies,
+# signed into nothing. `tell application "Google Chrome"` picks one of them at
+# random -- it once opened the brief in a Playwright window, where every GitHub
+# link hit a sign-in page. So: find the ONE Chrome process with no
+# --user-data-dir (yours) and address it by pid, never by name.
+CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+real_chrome_pid() {
+  ps -axo pid=,command= | awk -v bin="$CHROME_BIN" '
+    { cmd = $0; sub(/^ *[0-9]+ +/, "", cmd) }
+    # index()==1, not just a match: the awk process itself has the path in its argv.
+    index(cmd, bin) == 1 && cmd !~ /--type=/ && cmd !~ /--user-data-dir/ && !pid { pid = $1 }
+    END { if (pid) print pid }'   # no early `exit`: ps would take SIGPIPE, and pipefail fails the script
+}
+
+PID="$(real_chrome_pid)"
+if [[ -z "$PID" ]]; then
+  # Not running. Launch the binary directly rather than `open -a`, which can
+  # hand the request to a running Playwright copy instead of starting yours.
+  "$CHROME_BIN" "$URL" >/dev/null 2>&1 &!
+  for _ in {1..40}; do sleep 0.25; PID="$(real_chrome_pid)"; [[ -n "$PID" ]] && break; done
+  [[ -z "$PID" ]] && { echo "brief-open: Chrome did not start" >&2; exit 1; }
+  sleep 2 # let it finish restoring windows before we look for the tab
+fi
+
+osascript -l JavaScript - "$PID" "$URL" <<'JXA'
+ObjC.import("AppKit");
+function run([pid, target]) {
+  const chrome = Application(Number(pid));
+
+  // Find-or-open the tab.
+  let win = null;
+  for (const w of chrome.windows()) {
+    const tabs = w.tabs();
+    const i = tabs.findIndex((t) => t.url().startsWith(target));
+    if (i >= 0) {
+      w.activeTabIndex = i + 1;
+      tabs[i].reload();
+      win = w;
+      break;
+    }
+  }
+  if (!win) {
+    if (chrome.windows().length === 0) chrome.Window().make();
+    win = chrome.windows[0];
+    win.tabs.push(chrome.Tab({ url: target }));
+    win.activeTabIndex = win.tabs.length;
+  }
+  win.index = 1;
+
+  // Centre it on the primary display (the one with the menu bar), keeping its
+  // size unless it is larger than the screen. Cocoa's visibleFrame is
+  // bottom-left-origin; Chrome's bounds are top-left, hence the flip.
+  const screen = $.NSScreen.screens.objectAtIndex(0);
+  const full = screen.frame, vis = screen.visibleFrame;
+  const visTop = full.size.height - (vis.origin.y + vis.size.height);
+  const b = win.bounds();
+  const w = Math.min(b.width, vis.size.width), h = Math.min(b.height, vis.size.height);
+  win.bounds = {
+    x: Math.round(vis.origin.x + (vis.size.width - w) / 2),
+    y: Math.round(visTop + (vis.size.height - h) / 2),
+    width: Math.round(w),
+    height: Math.round(h),
+  };
+
+  // Activate THIS process. chrome.activate() would also work, but going through
+  // NSRunningApplication leaves no doubt about which Chrome comes forward.
+  $.NSRunningApplication.runningApplicationWithProcessIdentifier(Number(pid))
+    .activateWithOptions($.NSApplicationActivateAllWindows);
+}
+JXA
+
+# Marked only AFTER Chrome came forward. If osascript failed (permission denied,
+# Chrome wedged), the next unlock tries again rather than the day going dark.
+touch "$SEEN"

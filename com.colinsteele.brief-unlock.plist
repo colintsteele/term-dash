@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.colinsteele.brief-unlock</string>
+
+  <!-- Resident: bin/unlock-watch listens for screen-unlock / wake and runs
+       brief-open, which brings the morning brief forward in Chrome once per
+       weekday. zsh -lic for the same reason morning-brief.plist uses it:
+       brief-open may have to BUILD the brief (Mac asleep at 06:00), and that
+       needs nvm's node and the three API tokens from the interactive profile. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/colinsteele/Code/term-dash/bin/unlock-watch</string>
+    <string>/bin/zsh</string>
+    <string>-lic</string>
+    <string>exec "$HOME/Code/term-dash/brief-open" --if-unseen</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/colinsteele/.cache/termdash/brief-unlock.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/colinsteele/.cache/termdash/brief-unlock.log</string>
+</dict>
+</plist>

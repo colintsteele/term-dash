@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 #
-# termdash — tmux dashboard, 3-column layout:
-#   [left, 15%: local-status / worktrees]  [middle, 70%: fat terminal]  [right, 15%: git-notiql / Notion to-do]
+# termdash — tmux dashboard: a full-width status strip over a 3-column layout
+#   ┌─────────────── local-status (1 row, spans everything) ───────────────┐
+#   [left, 15%: worktrees]  [middle, 70%: fat terminal]  [right, 15%: git-notiql / Notion to-do]
+#
+# local-status was a box in the left column; it is now the strip across the top.
+# It reads left-justified/centered/right-justified, so it needs the whole window
+# width to lay out — a 15%-wide column had nowhere to center anything.
 #
 # git-notiql moved to the top-right column here. Given how inconsistent its
 # emoji rendering has been across different layout attempts in testing,
@@ -12,7 +17,16 @@
 #   termdash up        start the dashboard (or attach if already running)
 #   termdash down      kill the dashboard session
 #   termdash restart   down, then up
-#   termdash status     show what's running in each pane
+#   termdash status    show what's running in each pane
+#   termdash brief       bring the brief's Chrome page forward (also prefix+b)
+#   termdash brief-fresh rebuild it from nothing first, then bring it forward
+#                        (also prefix+B)
+#   termdash brief-popup the old text brief, popped over the layout
+#   termdash brief-now   render to stdout at this terminal's width, no popup
+#   termdash open-prs    open every PR in the git-notiql pane; what the ⧉ link in
+#                        that pane clicks through to, via ~/Applications/Open PRs.app
+#   termdash open-prs left|right   just one column of that pane, via
+#                        ~/Applications/Open PRs (left|right).app
 #
 # INSTALL:
 #   Leave this file inside the term-dash folder. Alias it, e.g. in ~/.zshrc:
@@ -22,11 +36,15 @@ set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # CONFIG — edit to match your actual filenames.
-# Layout: [left, 15% width] [middle, 70% width] [right, 15% width]
-#   left column:  top = local-status (small), bottom = worktrees (remainder,
-#                 our CI-focused panel — CI status is folded into each row)
+# Layout: [full-width status strip] over [left, 15%] [middle, 70%] [right, 15%]
+#   top strip:    local-status — clock/battery left, key alerts centered,
+#                 CPU/MEM/:3000 right. Spans the full window width.
+#   left column: top = worktrees (our CI-focused panel — CI status is folded
+#                 into each row), bottom = peers (what the rest of the team is
+#                 working on, from Shortcut)
 #   middle:       plain terminal, no command — just a normal shell
-#   right column: top = git-notiql (remainder), bottom = Notion to-do adder
+#   right column: top = git-notiql (remainder), bottom = Notion to-do
+#                 (this week's list — click a row to check it off, type to add)
 # ---------------------------------------------------------------------------
 
 SESSION="termdash"
@@ -36,18 +54,102 @@ LEFT_WIDTH_PCT=15
 RIGHT_WIDTH_PCT=15
 # middle gets whatever's left (~70%)
 
-# local-status prints a single line today; 2 rows leaves headroom in case it
-# grows to a second line without the pane clipping it.
-LEFT_TOP_HEIGHT=2
-LEFT_TOP_CMD="npx tsx local-status.ts"
+# The status strip. 1 row on purpose — local-status writes exactly one line with
+# no trailing newline, so a taller pane would just be dead space. tmux adds its
+# own border row below it, which is the visual separator from the columns.
+STATUS_HEIGHT=1
+STATUS_CMD="npx tsx local-status.ts"
+
+# Environment handed to the WIDGET panes only — every pane below is created with
+# it, and the middle pane deliberately is not (it comes from `new-session`).
+#
+# SPINNER_OFF turns off the braille spinner in ~/.zsh-sources/spinner.zsh. That
+# spinner paints to /dev/tty while a foreground command runs, and every widget
+# here IS a foreground command that never exits — so its painter stayed alive for
+# the life of the dashboard, burning ~0.8% CPU per pane and stamping braille over
+# the widget's own output twelve times a second. Past the spinner's 60s
+# full-width stage it does that at COLUMNS-2: a 55-cell wave across a 57-column
+# pane. The middle pane is an ordinary prompt and keeps its spinner, which is
+# where you actually want it.
+#
+# `-e` and not an `export` sent with send-keys: preexec runs in the shell BEFORE
+# the command line executes, so a variable set on that same line is set too late
+# to be seen. The pane's environment is the only place it can live.
+PANE_ENV="-e SPINNER_OFF=1"
+
 # worktrees panel — replaces the standalone circleci panel; CI status is folded
 # into each worktree row (colored ● dot), so this is now our CI-focused panel.
-LEFT_BOTTOM_CMD="npx tsx cursor-status.ts"
+LEFT_CMD="npx tsx cursor-status.ts"
 
-# right column: git-notiql takes the remainder (top), Notion to-do fixed (bottom)
+# peers panel — one block per teammate under the worktrees: a name line plus up
+# to two ticket rows.
+#
+# This is only the STARTING height. The pane resizes itself to the rows it
+# actually prints (see selfSize in shortcut-peers.ts) and hands the slack back to
+# the worktrees panel above, so worktrees grows on its own when a teammate has
+# nothing on. Nothing here needs adjusting when the team's workload changes; the
+# only knob is PEERS_MAX_ROWS in that file, which is what reserves a floor for
+# worktrees. TERMDASH_NO_AUTOSIZE=1 pins it to this value instead.
+LEFT_BOTTOM_HEIGHT=12
+LEFT_BOTTOM_CMD="npx tsx shortcut-peers.ts"
+
+# right column: git-notiql takes the remainder (top), Notion to-do fixed (bottom).
+# The to-do pane is now a scrollable list of this week's items, not just an input
+# box, so it needs real height — 4 rows left room for two list lines.
 RIGHT_TOP_CMD="npx tsx git-notiql.ts"
-RIGHT_BOTTOM_HEIGHT=4
+RIGHT_BOTTOM_HEIGHT=18
 RIGHT_BOTTOM_CMD="npx tsx notion-todo.ts"
+
+# ---------------------------------------------------------------------------
+# MORNING BRIEF — the one part of this dashboard that is not a pane.
+#
+# It is a popup, because the brief is read ONCE and then wants to be gone. A
+# fifth pane would cost permanent screen area to display something that is stale
+# by 9am; `display-popup` (tmux 3.2+) floats over the layout, borrows no space
+# from it, and disappears on q.
+#
+# Generation and display are deliberately separate events:
+#   06:00  launchd fires `morning-brief.ts --write` and caches today's brief.
+#          All the slow work — Shortcut, GitHub GraphQL, three Sentry queries —
+#          happens here, off the critical path, whether or not you are at the desk.
+#   arrival the client-attached AND client-focus-in hooks pop the cached brief the
+#          FIRST time you show up on a given day — whether that is a fresh attach
+#          or just unlocking the Mac in front of a session that never detached.
+#          Popping it at 06:00 sharp would show it to an empty chair, or worse, to
+#          a chair you sat down in at 06:20 having already dismissed it with a
+#          stray keypress.
+#   prefix+b  re-opens it any time. This is what makes "ephemeral" safe: getting
+#          rid of the popup is never destructive, so dismissing it costs nothing.
+# ---------------------------------------------------------------------------
+BRIEF_CMD="$DASHBOARD_DIR/morning-brief.ts"
+BRIEF_CACHE="$HOME/.cache/termdash"
+BRIEF_KEY="b"       # cached copy, instant
+BRIEF_KEY_FRESH="B" # full rebuild from scratch
+
+# Written by git-notiql.ts on every paint: the PRs actually ON SCREEN, one url per
+# line. Reading a file rather than asking the pane is what makes prefix+O instant,
+# and it is what guarantees the browser gets exactly what your eyes are looking at.
+NOTIQL_PRS="$BRIEF_CACHE/notiql-prs.txt"
+# Sized to the CONTENT, not to the screen, and that is what centers it: tmux
+# centers the popup itself, so a popup exactly as wide as the brief puts the
+# brief in the middle of the window. A 90%-wide popup centered a mostly-empty
+# box and left the text against its left border.
+# 130 is morning-brief.ts's BRIEF_WIDTH; +7 covers the two borders, a column of
+# breathing room each side, and a couple of columns of slack for emoji. The
+# section rules carry 🔥 / 📅 / 🤝, which JS .length counts as one character and
+# a terminal renders as two, so a line computed as exactly 130 can paint 132.
+# Change one, change the other.
+BRIEF_POPUP_W="137"
+# Height is computed per-invocation from the brief's actual length — see
+# brief_popup. A fixed percentage cannot work: `less` BOTTOM-aligns content that
+# is shorter than the screen, so an 80%-tall popup around a 16-line brief opened
+# with a dozen blank rows between the title bar and "MORNING BRIEF".
+BRIEF_POPUP_H_MAX_PCT=90
+
+# There is no staleness heuristic, on purpose. A regeneration is ~13 seconds of
+# network (Sentry, GitHub, Shortcut — it will not get faster), and guessing when
+# you are willing to pay that was always going to be wrong half the time. So the
+# choice is yours and it is explicit: `b` shows what is cached, `B` rebuilds.
 
 # ---------------------------------------------------------------------------
 
@@ -55,10 +157,235 @@ session_exists() {
   tmux has-session -t "$SESSION" 2>/dev/null
 }
 
+brief_seen_marker() {
+  echo "$BRIEF_CACHE/brief-$(date +%F).seen"
+}
+
+brief_file() {
+  echo "$BRIEF_CACHE/brief-$(date +%F).txt"
+}
+
+# Rebuild the brief from nothing: no cached render, no cached Sentry summaries.
+# Slow by design — this is the "what would today look like on a machine that had
+# never run this" button.
+#
+# A SEPARATE small popup rather than rebuilding inside the real one, because the
+# real popup's height is computed from the file's line count and that number does
+# not exist until the rebuild has finished. Doing it in one popup would mean
+# guessing the height, and guessing high brings back the blank-rows-above-content
+# problem that -X and the height arithmetic were added to fix.
+brief_rebuild() {
+  tmux display-popup -E -t "$SESSION:dashboard" -w 44 -h 3 \
+    -T " morning brief " \
+    "printf '  rebuilding from scratch…'; '$BRIEF_CMD' --fresh >/dev/null 2>&1"
+}
+
+# `less -RX`, and every one of those letters was earned:
+#   -R  passes OSC-8 hyperlinks through instead of printing the escape bytes.
+#       The brief links every PR, ticket and Sentry issue; without this it is
+#       a wall of \033]8;; garbage.
+#   -X  skips the alternate screen. NOT cosmetic — less's alt-screen entry
+#       emitted twelve newlines before the first line of content here, which
+#       showed up as a dozen blank rows between the popup title bar and
+#       "MORNING BRIEF". Isolated by bisecting the pipeline: `| cat` started at
+#       row 2, `| less -R` at row 13, `| less -RX` at row 2. Inside a popup the
+#       alternate screen buys nothing anyway — the popup is already a
+#       throwaway surface that tmux destroys on close.
+#   no -F  because the popup should STAY up when the brief is shorter than the
+#       screen, which is most mornings. -F would quit instantly and -E would
+#       then close the popup before it was read.
+brief_popup() {
+  # Fit the popup to the brief. +2 for the popup's own borders, +1 for the
+  # less status line ((END) / :). Without this the popup is taller than the
+  # content and less pads the difference ABOVE it, not below.
+  local file lines client_h max_h height
+  file="$(brief_file)"
+  lines=$([ -r "$file" ] && wc -l < "$file" || echo 20)
+  client_h=$(tmux display-message -p -t "$SESSION:dashboard" '#{client_height}')
+  max_h=$(( client_h * BRIEF_POPUP_H_MAX_PCT / 100 ))
+  height=$(( lines + 3 ))
+  [ "$height" -gt "$max_h" ] && height=$max_h
+
+  tmux display-popup -E -t "$SESSION:dashboard" \
+    -w "$BRIEF_POPUP_W" -h "$height" \
+    -T " morning brief — q to close " \
+    "'$BRIEF_CMD' --cached | less -RX"
+}
+
+# prefix + O — every PR in the git-notiql pane, in the browser at once.
+#
+# `open` with several urls at a time rather than one call per url: macOS focuses
+# the browser on each call, so a loop of them steals focus repeatedly and lands
+# the tabs out of order. One call opens them as a batch, in order.
+# Optional $1 = left|right: just that column of the two-column layout, from the
+# per-column ⧉ links ("Open PRs (left).app" / "(right).app").
+open_prs() {
+  local urls count list="$NOTIQL_PRS"
+  case "${1:-}" in
+    "") ;;
+    left|right) list="$BRIEF_CACHE/notiql-prs-$1.txt" ;;
+    *) note "open-prs: unknown column '$1' (want left or right)"; return 1 ;;
+  esac
+  if [ ! -r "$list" ]; then
+    note "no PR list yet — is the git-notiql pane running?"
+    return 1
+  fi
+  # -r drops the trailing blank line an empty pane leaves behind.
+  urls=$(grep -E '^https://' "$list" || true)
+  count=$(printf '%s' "$urls" | grep -c . || true)
+  if [ "${count:-0}" -eq 0 ]; then
+    note "git-notiql pane is empty — nothing to open"
+    return 0
+  fi
+  # shellcheck disable=SC2086 — word splitting on newlines is the point here.
+  printf '%s\n' "$urls" | xargs open
+  note "opened $count PR$([ "$count" -eq 1 ] || echo s)"
+}
+
+# Status line inside tmux, stdout outside it — this is callable both ways.
+# tmux may not be on PATH at all: the "Open PRs.app" shim runs this through
+# `do shell script`, whose PATH is bare. Falling back to stdout keeps a missing
+# tmux from turning a successful open into an error alert.
+note() {
+  if command -v tmux >/dev/null 2>&1 && session_exists; then
+    tmux display-message "$1"
+  else
+    echo "$1"
+  fi
+}
+
+# prefix + b — bring today's brief forward as the Chrome page (brief-open:
+# find-or-focus the tab, reload it, centre the window, activate Chrome). Builds
+# it first only if today's page doesn't exist yet.
+BRIEF_OPEN="$DASHBOARD_DIR/brief-open"
+brief() {
+  "$BRIEF_OPEN" >/dev/null 2>&1 || note "brief-open failed — run $BRIEF_OPEN by hand to see why"
+}
+
+# prefix + B — rebuild everything from scratch, then bring the page forward.
+# ~13s, so say so: run-shell -b gives no other sign that anything is happening.
+brief_fresh() {
+  note "rebuilding the morning brief…"
+  "$BRIEF_CMD" --fresh >/dev/null 2>&1 || { note "brief rebuild failed"; return 1; }
+  brief
+}
+
+# The old text brief in a tmux popup: what the attach/focus hooks below still
+# show until the popup is retired. Instant, never fetches. --cached still
+# generates on the spot in the one case where there is nothing to show at all
+# (you woke the machine after 6am, or launchd never fired).
+brief_text() {
+  if ! session_exists; then
+    # Outside tmux there is nothing to float over — just print it.
+    "$BRIEF_CMD" --cached
+    return
+  fi
+  brief_popup
+  touch "$(brief_seen_marker)"
+}
+
+# The popup's rebuild-then-show, kept with brief_text.
+brief_text_fresh() {
+  if ! session_exists; then
+    "$BRIEF_CMD" --fresh
+    return
+  fi
+  brief_rebuild
+  brief_popup
+  touch "$(brief_seen_marker)"
+}
+
+# The hook target for BOTH client-attached and client-focus-in. Silent and
+# instant on every firing after the first one of the day, which is what keeps a
+# popup-on-attach from becoming an irritation — focus-in fires every time you
+# cmd-tab back, so this path has to stay a single stat() and nothing else.
+brief_if_unseen() {
+  mkdir -p "$BRIEF_CACHE"
+  [ -e "$(brief_seen_marker)" ] && return 0
+  brief_text
+}
+
+# Bound on the SESSION so it dies with the dashboard rather than leaking a hook
+# and a keybinding into every other tmux session you open.
+#
+# TWO triggers, because `client-attached` alone has a hole you fall into most
+# mornings: it fires on ATTACH, and the overnight case never detaches. The Mac
+# sleeps or locks with the dashboard still attached, you unlock it at 8am, and
+# tmux — correctly — reports nothing happened. The brief sat in the cache all day.
+#
+#   client-attached  a client connects: `termdash up`, a reboot, a reattach after
+#                    prefix+d. The cold-start path.
+#   client-focus-in  the terminal reports that this client got the keyboard back:
+#                    unlocking the screen, cmd-tabbing back to iTerm, switching to
+#                    the dashboard's tab. The warm path, and the one that covers
+#                    "first login of the day" on a session that never went away.
+#
+# Both land on brief-if-unseen, which is idempotent against the day's .seen
+# marker — so the pair can't double-pop, and every focus-in after the first is a
+# file-exists test that returns immediately.
+#
+# focus-in is also self-guarding in a way a timer would not be: a locked screen
+# cannot hold keyboard focus, so the popup can never open to a lock screen and
+# burn the day's brief on nobody. That's why this is a hook and not a launchd
+# StartInterval poll.
+install_brief_bindings() {
+  # Server-scoped, and it must be set BEFORE the client attaches: tmux only
+  # requests focus reporting (DECSET 1004) from the terminal at attach time.
+  # Setting it on a live client is a no-op until that client detaches and comes
+  # back — which is why an already-running dashboard needs `termdash restart`
+  # (or a prefix+d / attach round-trip) to start honouring client-focus-in.
+  tmux set-option -s focus-events on
+  tmux set-hook -t "$SESSION" client-attached \
+    "run-shell -b \"'$DASHBOARD_DIR/termdash' brief-if-unseen\""
+  tmux set-hook -t "$SESSION" client-focus-in \
+    "run-shell -b \"'$DASHBOARD_DIR/termdash' brief-if-unseen\""
+  tmux bind-key -T prefix "$BRIEF_KEY" \
+    run-shell -b "'$DASHBOARD_DIR/termdash' brief"
+  tmux bind-key -T prefix "$BRIEF_KEY_FRESH" \
+    run-shell -b "'$DASHBOARD_DIR/termdash' brief-fresh"
+}
+
+# ---------------------------------------------------------------------------
+# iTerm2 look — the dashboard gets its own profile (background image) without a
+# second terminal app or a hand-opened window. OSC 1337 SetProfile repaints the
+# session in place.
+#
+# The profile lives in
+#   ~/Library/Application Support/iTerm2/DynamicProfiles/termdash.json
+# and was GENERATED from the active Default profile (Default Bookmark Guid
+# BA81BD0E-...), so it is literally your default settings plus the image keys.
+# Regenerate it if you change Default and want the dashboard to follow.
+#
+# A profile applies to an iTerm SESSION (window/tab), not to a tmux pane, so
+# this repaints the whole window the dashboard occupies. That is the intent —
+# per-pane backgrounds would require `tmux -CC` control mode.
+# ---------------------------------------------------------------------------
+ITERM_PROFILE="termdash"
+ITERM_PROFILE_DEFAULT="Default"
+
+iterm_set_profile() {
+  # No-op outside iTerm2: on any other terminal this sequence would either be
+  # ignored or printed as garbage, and this script has to stay portable enough
+  # to run under a plain shell.
+  [ "${TERM_PROGRAM:-}" = "iTerm.app" ] || return 0
+  printf '\033]1337;SetProfile=%s\a' "$1"
+}
+
 attach_or_switch() {
   if [ -n "${TMUX:-}" ]; then
+    # Already inside tmux, so we are not talking to iTerm directly: the sequence
+    # would need a tmux passthrough wrapper (plus `allow-passthrough on`) to get
+    # through, and switch-client returns immediately, so there is no natural
+    # point to restore the old profile. Deliberately left unstyled — the profile
+    # would otherwise stick to the window after you switch back to another
+    # session. A `client-session-changed` tmux hook is the real fix if this
+    # becomes the path you use most.
     tmux switch-client -t "$SESSION"
   else
+    iterm_set_profile "$ITERM_PROFILE"
+    # Restore on detach/interrupt so the window is not left wearing the
+    # dashboard background after the dashboard is gone.
+    trap 'iterm_set_profile "$ITERM_PROFILE_DEFAULT"' EXIT INT TERM
     tmux attach -t "$SESSION"
   fi
 }
@@ -73,34 +400,45 @@ up() {
   tmux new-session -d -s "$SESSION" -n dashboard -c "$DASHBOARD_DIR"
   remainder=$(tmux display-message -p -t "$SESSION:dashboard" '#{pane_id}')
 
+  # peel the STATUS STRIP off the top before anything else, so it spans the full
+  # window width. Every split after this one happens inside "remainder", which is
+  # now the region below the strip — that is what keeps the columns from cutting
+  # through it.
+  status_pane=$(tmux split-window -v -b -l "$STATUS_HEIGHT" -t "$remainder" $PANE_ENV \
+    -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
+  tmux send-keys -t "$status_pane" "clear && $STATUS_CMD" Enter
+
   # peel the LEFT column off first (this pane keeps its id, shrinks to the
   # right, and becomes the middle pane once the right column is also peeled)
-  left_pane=$(tmux split-window -h -b -p "$LEFT_WIDTH_PCT" -t "$remainder" \
+  left_pane=$(tmux split-window -h -b -p "$LEFT_WIDTH_PCT" -t "$remainder" $PANE_ENV \
     -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
 
   # peel the RIGHT column off what's left. RIGHT_WIDTH_PCT is a fraction of
   # the TOTAL width, but at this point "remainder" is only (100-LEFT)% of
   # total — so convert to a percentage of the current remainder first.
   right_pct_of_remainder=$(( RIGHT_WIDTH_PCT * 100 / (100 - LEFT_WIDTH_PCT) ))
-  right_pane=$(tmux split-window -h -p "$right_pct_of_remainder" -t "$remainder" \
+  right_pane=$(tmux split-window -h -p "$right_pct_of_remainder" -t "$remainder" $PANE_ENV \
     -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
   # remainder is now the middle pane — deliberately left as a plain shell,
   # no command sent
 
-  # left column: top = local-status (fixed height), bottom = circleci
-  # (whatever's left) — left_pane keeps its id and becomes the bottom pane
-  left_top=$(tmux split-window -v -b -l "$LEFT_TOP_HEIGHT" -t "$left_pane" \
+  # left column, top→bottom: worktrees (remainder), peers (fixed, small). Same
+  # shape as the right column — peel the fixed bottom pane off and let the top
+  # one keep its id and take whatever height is left.
+  left_bottom=$(tmux split-window -v -l "$LEFT_BOTTOM_HEIGHT" -t "$left_pane" $PANE_ENV \
     -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
-  tmux send-keys -t "$left_top" "clear && $LEFT_TOP_CMD" Enter
-  tmux send-keys -t "$left_pane" "clear && $LEFT_BOTTOM_CMD" Enter
+  tmux send-keys -t "$left_pane" "clear && $LEFT_CMD" Enter
+  tmux send-keys -t "$left_bottom" "clear && $LEFT_BOTTOM_CMD" Enter
 
   # right column, top→bottom: git-notiql (remainder), Notion to-do (fixed,
   # small). Peel the fixed bottom pane off; right_pane keeps its id and stays
   # the top pane, taking whatever height is left over.
-  right_bottom=$(tmux split-window -v -l "$RIGHT_BOTTOM_HEIGHT" -t "$right_pane" \
+  right_bottom=$(tmux split-window -v -l "$RIGHT_BOTTOM_HEIGHT" -t "$right_pane" $PANE_ENV \
     -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
   tmux send-keys -t "$right_pane" "clear && $RIGHT_TOP_CMD" Enter
   tmux send-keys -t "$right_bottom" "clear && $RIGHT_BOTTOM_CMD" Enter
+
+  install_brief_bindings
 
   tmux select-pane -t "$remainder"
   attach_or_switch
@@ -125,14 +463,38 @@ status() {
   fi
 }
 
+# `termdash up` brings the dashboard up in ITS OWN Kitty window on the Xeneon --
+# own geometry, own font size -- rather than taking over whatever terminal it was
+# typed in. cscode's bin/termdash-xeneon owns that window: a separate kitty
+# PROCESS plus kitty/xeneon.conf, because kitty keeps ONE global remembered
+# window size, so a second window in the same process cannot have its own.
+#
+# Guarded three ways so it can neither recurse nor hijack:
+#   * TERMDASH_IN_WINDOW is set by the launcher, so the inner call falls through
+#   * inside tmux we are already in a session; attach/switch as before
+#   * if the launcher is not installed, behave exactly as it always did
+XENEON_LAUNCHER="$HOME/.local/bin/termdash-xeneon"
+up_in_window() {
+  if [ -z "${TERMDASH_IN_WINDOW:-}" ] && [ -z "${TMUX:-}" ] && [ -x "$XENEON_LAUNCHER" ]; then
+    exec "$XENEON_LAUNCHER"
+  fi
+  up
+}
+
 cmd="${1:-}"
 case "$cmd" in
-  up) up ;;
+  up) up_in_window ;;
   down) down ;;
-  restart) down; sleep 0.3; up ;;
+  restart) down; sleep 0.3; up_in_window ;;
   status) status ;;
+  brief) brief ;;
+  brief-fresh) brief_fresh ;;
+  brief-popup) brief_text ;;
+  open-prs) open_prs "${2:-}" ;;
+  brief-if-unseen) brief_if_unseen ;;
+  brief-now) "$BRIEF_CMD" ;;
   *)
-    echo "Usage: termdash {up|down|restart|status}"
+    echo "Usage: termdash {up|down|restart|status|brief|brief-fresh|brief-popup|brief-now|open-prs}"
     exit 1
     ;;
 esac

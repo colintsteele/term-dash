@@ -14,8 +14,10 @@
  *   2b. Shortcut ticket       → a cyan ◆ right after the ⎇, shown when the branch
  *        has an sc-<id>. cmd/ctrl-click → the Shortcut story (app.shortcut.com).
  *   2c. hubdiff               → a white ± right after the ◆, on every row.
- *        cmd/ctrl-click → this worktree's diff in the local hubdiff app
- *        (http://hubdiff.localhost/?repo=<url-encoded worktree path>).
+ *        cmd/ctrl-click → this worktree's diff in the native Hubdiff.app via its
+ *        own URL scheme (hubdiff://?repo=<url-encoded worktree path>), which
+ *        repoints the already-open window. Deliberately NOT a browser link: the
+ *        diff viewer is its own app, not another Chrome tab.
  *   3. Cursor agent state     → the trailing glyph after the branch name.
  *        (anim) running · ✓ done · !! waiting on you (a question) · ✗ error ·
  *        (dim) no agent.  cmd/ctrl-click the NAME → focuses that Cursor window.
@@ -71,7 +73,8 @@
  * All local except the CircleCI read. No accessibility permission needed.
  *
  * SETUP:
- *   export CIRCLECI_TOKEN=...   # optional; without it, CI dots stay gray
+ *   export CIRCLE_CI_TOKEN=...  # optional; without it, CI dots stay gray
+ *                                (CIRCLECI_TOKEN is honored as a fallback)
  *   npx tsx cursor-status.ts
  * TESTING:
  *   npx tsx cursor-status.ts --mock   # one fixed frame, no FS/git/network
@@ -98,8 +101,47 @@ const ANIM_INTERVAL_MS = 500; // running-glyph animation frame; ~2s per full swe
 const MAX_ROWS = 12;
 const RUNNING_WINDOW_MS = 20_000; // transcript touched this recently + turn open = running (fallback)
 
-const CIRCLECI_TOKEN = process.env.CIRCLECI_TOKEN;
+// Two CircleCI vars exist in this shell and only one works: CIRCLECI_TOKEN was
+// revoked (401 on every endpoint, including /me) while CIRCLE_CI_TOKEN is live.
+// Prefer the working one -- same fallback herdr-sync.ts uses. Reading only the
+// dead name silently 401d every CI call and greyed out every dot, and the
+// "no token" warning below stayed quiet because the var WAS set, just worthless.
+//
+// Collapse this to a single var once the dead token is rotated out of keys.zsh.
+const CIRCLECI_TOKEN = process.env.CIRCLE_CI_TOKEN || process.env.CIRCLECI_TOKEN;
 const CIRCLECI_API = "https://circleci.com/api/v2";
+
+// Sentry. Read-only, and used for exactly two things: deciding that a branch is a
+// FIX rather than a feature, and putting a clickable △ on the row.
+//
+// us.sentry.io, not sentry.io: the regional host is what serves issue and shortid
+// endpoints for this org. (morning-brief.ts learned the same thing — see the note
+// above its SENTRY_API.)
+const SENTRY_TOKEN = process.env.SENTRY_AUTH_TOKEN;
+const SENTRY_API = "https://us.sentry.io/api/0";
+const SENTRY_ORG = "popmenu";
+// A short id is <PROJECT>-<SUFFIX> and the suffix alone is not addressable, so a
+// bare suffix off a worktree directory has to be tried against each project.
+const SENTRY_PROJECT_PREFIXES = ["POPMENU-WEB-RAILS", "POPMENU-WEB-REACT"];
+// Outline triangle, to pair with the filled ◆ of the Shortcut story beside it and
+// echo Sentry's own chevron mark. Ambiguous-width like ◆, which this pane already
+// renders at one cell, so it costs the same two cells every other glyph does.
+const SENTRY_GLYPH = "△";
+
+// Architecture review. Popmenu gates a set of paths — migrations, schema, Sidekiq
+// config, secrets, the security-check allowlists — behind @Popmenu/architecture in
+// CODEOWNERS. Touching one means the PR needs THAT team's approval on top of the
+// usual two, and it is the approval most likely to be the one you are waiting on.
+//
+// Computed from CODEOWNERS against the worktree's own diff, NOT from GitHub's
+// reviewRequests. Checked first and rejected: this repo does not auto-request the
+// team (PR 35906 touches `db/migrate` and its reviewRequests array is empty), so
+// asking GitHub would have reported "not needed" on exactly the PRs that need it.
+// Reading the diff also means the marker appears the moment you add a migration,
+// before any PR exists at all.
+const ARCH_TEAM = "@Popmenu/architecture";
+const ARCH_TEAM_API = "Popmenu/architecture";
+const ARCH_GLYPH = "A";
 
 // ANSI
 const RESET = "\x1b[0m";
@@ -119,6 +161,9 @@ const PURPLE = "\x1b[38;2;137;87;224m"; // GitHub "merged" hue — distinguishes
 // which keeps the default foreground.
 const DIM_MAGENTA = DIM + MAGENTA;
 const WHITE = "\x1b[97m";
+// Sentry's brand violet (#6C5FC7). Close to PURPLE above, but they never share a
+// column — PURPLE is the merged-PR ↥, this is the △ two glyphs to its right.
+const SENTRY_VIOLET = "\x1b[38;2;108;95;199m";
 const HIDE_CURSOR = "\x1b[?25l";
 const SHOW_CURSOR = "\x1b[?25h";
 
@@ -207,10 +252,12 @@ interface Worktree {
   agentState: AgentState; // rolled-up agent badge
   ci: Ci;
   prUrl?: string; // GitHub PR for this branch (undefined = repo has no GitHub slug)
+  hasPr?: boolean; // gh resolved a real PR for this branch (prUrl alone may be the search fallback)
   pushed: boolean; // `origin/<branch>` exists locally → the branch is on the remote, so a PR is possible
   approvals: number; // # of APPROVED reviews on that PR (0 if none / no PR / not resolved yet)
   merged: boolean; // the branch's most recent PR is MERGED → worktree is `worktree clean`-able
   devRunning: boolean; // a process serving DEV_PORT has its cwd inside this worktree
+  arch?: ArchState; // this branch touches @Popmenu/architecture-owned paths (undefined = it doesn't)
 }
 
 // CircleCI slug ("gh/Popmenu/popmenu") → "owner/repo", or null for non-gh slugs.
@@ -239,22 +286,25 @@ function prSearchUrl(slug: string, branch: string): string | undefined {
 // alongside the URL. Returns url:null if gh is missing/unauthed, there's no PR, or
 // the lookup errors — callers fall back to prSearchUrl. Network call, so this only
 // runs on the slow lane. `timeout` guards against gh hanging.
-function resolvePr(slug: string, branch: string): { url: string | null; approvals: number; merged: boolean } {
+function resolvePr(slug: string, branch: string): { url: string | null; approvals: number; merged: boolean; approvers: string[] } {
   const repo = githubRepo(slug);
-  if (!repo) return { url: null, approvals: 0, merged: false };
+  const none = { url: null, approvals: 0, merged: false, approvers: [] as string[] };
+  if (!repo) return none;
   try {
     const out = execFileSync(
       "gh",
       ["pr", "list", "--repo", repo, "--head", branch, "--state", "all",
        "--json", "url,state,latestReviews", "--limit", "1",
-       "--jq", '.[0] // empty | {url, merged: (.state == "MERGED"), approvals: ([.latestReviews[] | select(.state=="APPROVED")] | length)}'],
+       // `approvers` rides along in the same request as `approvals`, from the
+       // same array — it is what tells an architecture approval from any other.
+       "--jq", '.[0] // empty | {url, merged: (.state == "MERGED"), approvals: ([.latestReviews[] | select(.state=="APPROVED")] | length), approvers: [.latestReviews[] | select(.state=="APPROVED") | .author.login]}'],
       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 }
     ).trim();
-    if (!out) return { url: null, approvals: 0, merged: false };
+    if (!out) return none;
     const o = JSON.parse(out);
-    return { url: o.url ?? null, approvals: o.approvals ?? 0, merged: o.merged ?? false };
+    return { url: o.url ?? null, approvals: o.approvals ?? 0, merged: o.merged ?? false, approvers: o.approvers ?? [] };
   } catch {
-    return { url: null, approvals: 0, merged: false };
+    return none;
   }
 }
 
@@ -794,12 +844,19 @@ const ciCache = new Map<string, Ci>();
 const prCache = new Map<string, string>(); // slug+branch → direct PR url (from gh)
 const approvalsCache = new Map<string, number>(); // slug+branch → # APPROVED reviews (from gh)
 const mergedCache = new Map<string, boolean>(); // slug+branch → most-recent PR is MERGED (from gh)
+const archCache = new Map<string, ArchState>(); // worktree path → architecture-review state (absent = not gated)
 const scTierCache = new Map<string, ScTier>(); // shortcut story id → pipeline tier (from the Shortcut API)
+// The rest of the story, off the SAME request the tier comes from, so it is free.
+// `story_type` is the cheapest "is this a fix" signal there is, and `description`
+// is where a Sentry-filed ticket puts its issue link.
+const scStoryCache = new Map<string, { type: string; description: string }>();
 let slowFetchedAt = 0;
 let slowInFlight = false;
 
 function ciKey(slug: string, branch: string): string {
-  return `${slug} ${branch}`;
+  // \0 as an escape, not a raw NUL byte: a literal NUL in the source makes grep
+  // and file(1) classify this whole file as binary and skip it.
+  return `${slug}\0${branch}`;
 }
 
 // Refresh the CI + PR caches for every repo's current worktree branches. Runs on
@@ -826,7 +883,7 @@ async function refreshSlow(): Promise<void> {
       const mainBranch = wts[0]?.branch;
       for (const branch of branches) {
         if (branch === mainBranch) continue;
-        const { url, approvals, merged } = resolvePr(repo.slug, branch);
+        const { url, approvals, merged, approvers } = resolvePr(repo.slug, branch);
         // Only cache on a resolved PR, so a transient gh failure (url:null,
         // approvals:0) never clobbers a previously-known URL, approval count, or
         // merged flag.
@@ -834,6 +891,21 @@ async function refreshSlow(): Promise<void> {
           prCache.set(ciKey(repo.slug, branch), url);
           approvalsCache.set(ciKey(repo.slug, branch), approvals);
           mergedCache.set(ciKey(repo.slug, branch), merged);
+        }
+
+        // Architecture gate. Local git + a cached CODEOWNERS parse, so this runs
+        // whether or not the branch has a PR yet; `approvers` only decides
+        // needed-vs-approved once one exists.
+        const wt = wts.find((x) => x.branch === branch);
+        const patterns = archPatterns(repo.dir);
+        if (wt && patterns.length) {
+          const touched = changedFiles(wt.wtPath).some((f) => patterns.some((re) => re.test(f)));
+          if (!touched) archCache.delete(wt.wtPath);
+          else {
+            const members = architectureMembers();
+            const ok = approvers.some((a) => members.has(a.toLowerCase()));
+            archCache.set(wt.wtPath, ok ? "approved" : "needed");
+          }
         }
       }
     }
@@ -877,9 +949,12 @@ async function refreshShortcut(): Promise<void> {
 
   for (const id of ids) {
     try {
-      const story = await sc<{ workflow_state_id: number }>(`/stories/${id}`);
+      const story = await sc<{ workflow_state_id: number; story_type?: string; description?: string }>(
+        `/stories/${id}`
+      );
       const tier = scStateTiers.get(story.workflow_state_id);
       if (tier) scTierCache.set(id, tier);
+      scStoryCache.set(id, { type: story.story_type ?? "", description: story.description ?? "" });
     } catch {
       /* leave the previous tier in place */
     }
@@ -933,11 +1008,13 @@ function gather(): Worktree[] {
         prUrl: repo.slug
           ? prCache.get(ciKey(repo.slug, branch)) ?? prSearchUrl(repo.slug, branch)
           : undefined,
+        hasPr: repo.slug ? prCache.has(ciKey(repo.slug, branch)) : false,
         pushed: pushed ? pushed.has(branch) : true, // null (unknown) → don't desaturate
         scTier: (() => { const id = shortcutId(branch); return id ? scTierCache.get(id) : undefined; })(),
         approvals: repo.slug ? approvalsCache.get(ciKey(repo.slug, branch)) ?? 0 : 0,
         merged: repo.slug ? mergedCache.get(ciKey(repo.slug, branch)) ?? false : false,
         devRunning: false, // resolved below, once all worktrees are known
+        arch: archCache.get(wtPath),
       });
     }
   }
@@ -962,15 +1039,66 @@ function gather(): Worktree[] {
   // agent activity happens to put it (popmenu's main checkout has hundreds of
   // sessions, so mtime ordering would shuffle it around), and it should never be
   // truncated away when you have a lot of worktrees open.
-  // Below it, linked worktrees keep the old ordering: newest agent activity first,
-  // worktrees with no agents sinking to the bottom.
+  // Below it, linked worktrees split into two sections — ticketed work (see
+  // isTicket) then untracked work that has a PR anyway — each keeping the
+  // old ordering internally: newest agent activity first, worktrees with no agents
+  // sinking to the bottom. The groups are returned CONTIGUOUSLY because render()
+  // draws its section rules by watching for the group to change as it walks the
+  // list; interleaving them here would emit a rule between every row.
+  // Linked worktrees only make the panel when they're real work: see isTrackedWork.
   const main = worktrees.filter((w) => w.isMain);
-  const linked = worktrees.filter((w) => !w.isMain);
+  const linked = worktrees.filter((w) => !w.isMain && isTrackedWork(w));
   linked.sort((a, b) => b.mtime - a.mtime);
-  return [...main, ...linked.slice(0, MAX_ROWS)];
+
+  const ticketed = linked.filter(isTicket);
+  const projects = linked.filter((w) => !isTicket(w));
+  const [nTicket, nProject] = splitBudget(ticketed.length, projects.length, MAX_ROWS);
+  return [...main, ...ticketed.slice(0, nTicket), ...projects.slice(0, nProject)];
+}
+
+// A linked worktree earns a row only if it's tied to a ticket or a PR. Prototypes
+// and scratch worktrees (help-me-write-prototype, ruby-llm-gem-test, …) pile up and
+// crowded out the work that actually has a reviewer or a story waiting on it.
+// Three ways in:
+//   - the directory is T-prefixed — the naming convention for ticket worktrees,
+//     which holds even before the branch is renamed to carry its sc- id
+//   - the branch carries an sc-<id>
+//   - gh has resolved a PR for the branch. A PR-only worktree therefore appears
+//     one slow tick after startup, once refreshSlow has filled prCache.
+function isTrackedWork(w: Worktree): boolean {
+  return isTicket(w) || !!w.hasPr;
+}
+
+function isTicket(w: Worktree): boolean {
+  return path.basename(w.wtPath).startsWith("T-") || !!shortcutId(w.branch);
+}
+
+// MAX_ROWS is a pane-height budget, and it's now spent across two sections. A flat
+// slice would let a busy ticket list push every spike off the bottom — which defeats
+// the point of separating them in the first place — so projects are guaranteed up to
+// PROJECT_ROW_FLOOR rows whenever they have any, and tickets take the remainder.
+const PROJECT_ROW_FLOOR = 3;
+
+function splitBudget(nTicket: number, nProject: number, budget: number): [number, number] {
+  if (nTicket + nProject <= budget) return [nTicket, nProject];
+  const floor = Math.min(nProject, PROJECT_ROW_FLOOR);
+  const takeTicket = Math.max(0, Math.min(nTicket, budget - floor));
+  return [takeTicket, Math.min(nProject, Math.max(0, budget - takeTicket))];
 }
 
 // ---- render ----
+
+// Which section a row belongs to. The panel groups by KIND of work rather than by
+// repo or recency: master is a handle for jumping into the repo, an sc- branch is
+// ticketed work with a story and a PR behind it, and anything else is a spike or a
+// side project with neither. They want different things from you, so they get
+// separated by a rule.
+type Section = "main" | "ticket" | "project";
+
+function sectionOf(w: Worktree): Section {
+  if (w.isMain) return "main";
+  return isTicket(w) ? "ticket" : "project";
+}
 
 function ciDot(status: CiStatus): string {
   if (["failed", "failing", "error"].includes(status)) return `${RED}●${RESET}`;
@@ -1040,12 +1168,45 @@ function scColor(tier: ScTier | undefined): string {
 // hubdiff takes the worktree directory, so it's always available (unlike the PR
 // or story links, which need a slug / ticket id) — hence bright white rather
 // than a status hue. cmd/ctrl-click → that worktree's diff in hubdiff.
+//
+// This is the NATIVE Hubdiff.app (Electron, com.colinsteele.hubdiff), not the
+// browser copy on hubdiff.localhost: the app registers the `hubdiff:` scheme
+// (CFBundleURLTypes) and its `open-url` handler reads ?repo= and repoints the
+// single window — same "one surface, repointed per worktree" behavior the tab-
+// reuse path gave us, minus the browser. macOS routes the scheme to the running
+// instance (or launches it), so there is no port and no tab to keep alive.
 const DIFF_GLYPH = "±";
-const HUBDIFF_BASE = "http://hubdiff.localhost/";
+// Scheme + "//" so the path lands in the QUERY, not the URL path: `hubdiff://`
+// parses with an empty host, and ?repo= survives percent-decoding intact.
+const HUBDIFF_BASE = "hubdiff://";
 
 function hubdiffUrl(wtPath: string): string {
   return `${HUBDIFF_BASE}?repo=${encodeURIComponent(wtPath)}`;
 }
+
+// The branch name's cmd-click target: the worktree's Space in Herdr.
+//
+// Path in the URL's PATH component, not its HOST — hence the split/encode/join
+// rather than a flat encodeURIComponent, which would percent-escape the slashes
+// and shove the whole path into the host. NSURL LOWERCASES a host, and a
+// lowercased /users/colinsteele/code/... no longer string-matches the paths
+// `herdr worktree list` reports, even though APFS would still open it.
+//
+// Handled by HerdrOpen.app → herdr-open.sh, which focuses the existing Space for
+// that checkout or creates one. See build-herdr-open-app.sh.
+function herdrSpaceUrl(wtPath: string): string {
+  return `herdr-space://${wtPath.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+// Where the branch name points. Herdr when its handler is installed, Cursor
+// otherwise — same reasoning as REUSE_TABS above: a `herdr-space:` link is inert
+// on a machine without the .app, so anyone cloning this repo keeps today's
+// open-in-Cursor behavior instead of a name that clicks to nothing. Force either
+// way with TERMDASH_HERDR_LINKS=1 / =0.
+const HERDR_LINKS =
+  process.env.TERMDASH_HERDR_LINKS === "1" ||
+  (process.env.TERMDASH_HERDR_LINKS !== "0" &&
+    fs.existsSync(`${os.homedir()}/Applications/HerdrOpen.app`));
 
 function gitGlyph(prUrl: string | undefined, merged: boolean, pushed: boolean): string {
   // The trailing space lives INSIDE the linked/glyph text so the cmd-click
@@ -1079,10 +1240,24 @@ function gitGlyph(prUrl: string | undefined, merged: boolean, pushed: boolean): 
 // alignment. Static (the ⎇ beside it is what links the PR).
 const APPROVALS_NEEDED = 2;
 
-function approvalsSlot(approvals: number): string {
+// When the branch is architecture-gated, the LAST cell stops being a generic
+// approval and becomes that specific one: yellow `A` outstanding, green `A` once
+// a member of @Popmenu/architecture has approved. Yellow because it matches the
+// ◆ qa tier — both mean "waiting on somebody who is not you".
+//
+// It takes a cell rather than adding one on purpose. The slot has to stay
+// APPROVALS_NEEDED wide or every row's name column shifts under it, and when
+// architecture is on the hook that IS the gating fact — a second generic
+// approval does not merge the PR, so showing it instead would be the less true
+// of the two. Ungated rows are untouched.
+function approvalsSlot(approvals: number, arch: ArchState | undefined): string {
   let out = "";
-  for (let i = 0; i < APPROVALS_NEEDED; i++) {
+  const generic = arch ? APPROVALS_NEEDED - 1 : APPROVALS_NEEDED;
+  for (let i = 0; i < generic; i++) {
     out += i < approvals ? `${GREEN}✓${RESET}` : `${DIM}·${RESET}`;
+  }
+  if (arch) {
+    out += arch === "approved" ? `${GREEN}${ARCH_GLYPH}${RESET}` : `${BOLD}${YELLOW}${ARCH_GLYPH}${RESET}`;
   }
   return out;
 }
@@ -1122,6 +1297,25 @@ function agentGlyph(state: AgentState, frame: number): string {
   }
 }
 
+// The agent glyph moved from the right end of the row to the status block on the
+// left, and that move is why this exists: the glyphs are 1, 2 and 4 cells wide
+// (`·`, `!!`, the 4-slot running track). Trailing, the ragged width cost nothing.
+// Leading, it would shift the branch column on every row whose agent state
+// differed, so the slot is padded to the widest of them and the glyph centred in
+// it — centred rather than flush-left so a lone `·` doesn't hang off the edge of
+// its column next to the approvals.
+const AGENT_SLOT = RUN_TRACK;
+
+function agentSlotWidth(state: AgentState): number {
+  return state === "running" ? RUN_TRACK : state === "waiting" ? 2 : 1;
+}
+
+function agentSlot(state: AgentState, frame: number): string {
+  const slack = Math.max(0, AGENT_SLOT - agentSlotWidth(state));
+  const left = Math.floor(slack / 2);
+  return " ".repeat(left) + agentGlyph(state, frame) + " ".repeat(slack - left);
+}
+
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
@@ -1133,8 +1327,8 @@ function truncate(s: string, n: number): string {
 // room. So keep the longest whole-segment (`/`-delimited) suffix that still fits
 // in `width`. A short tail gets its prefix back — `steele/migrate-shortcut`
 // (23) instead of a bare `migrate-shortcut` (16) — while a long tail is shown
-// alone and left to marquee. Single-segment branches (master, a bare tail) are
-// returned unchanged.
+// alone and handed to displayBranch, which swaps in its cached summary.
+// Single-segment branches (master, a bare tail) are returned unchanged.
 function fitBranch(branch: string, width: number): string {
   const segs = branch.split("/");
   let out = segs[segs.length - 1]; // always keep the meaningful tail
@@ -1146,58 +1340,548 @@ function fitBranch(branch: string, width: number): string {
   return out;
 }
 
-// Branch names get a fixed display window; anything longer marquees instead of
-// truncating (see marquee). Capped to the pane width on narrow terminals — the
-// subtracted budget is the glyph gutter left of the name (dot + approvals +
-// ⎇ + ◆ + ±, with their spaces) plus the trailing agent glyph.
+// Branch names get a fixed display window; anything longer is shown as its cached
+// summary instead (see displayBranch). Capped to the pane width on narrow terminals.
+// The subtracted budget is everything that is not the name, and the row is now two
+// blocks with the name between them:
+//
+//   ●  ··A  ·•··      <name>      ⎇ ◆ △ ±
+//   status: CI dot,   the work    glyphs: every cmd-click target
+//   approvals, agent               (PR, story, sentry, diff)
+//
+//   1 dot + 1 gap + 2 approvals + 1 gap + 4 agent + 2 gap = 11 left
+//   2 gap + 8 glyphs                                      = 10 right
+//   + the 2 cells the name block carries for its ◂ dev marker
+//
+// 23 in total. Change the row in render() and change this, or the name column
+// stops being centred and the right-hand glyphs wrap.
 const NAME_WIDTH = 36;
 function nameWindow(sepWidth: number): number {
-  return Math.min(NAME_WIDTH, Math.max(10, sepWidth - 17));
+  return Math.min(NAME_WIDTH, Math.max(10, sepWidth - 23));
 }
 
 
-// How many animation frames a marquee rests at its home position (first character
-// flush left) before scrolling again. At ANIM_INTERVAL_MS = 500 this is a ~3s pause.
-const MARQUEE_HOLD_FRAMES = 6;
+// ---- branch summaries: what replaced the marquee ---------------------------
+//
+// Long branch names used to SCROLL. That meant the pane repainted every 500ms
+// forever — `render` clears the whole screen each frame (\x1b[3J\x1b[2J\x1b[H),
+// so a single overlong name put the entire panel into a permanent flicker, and
+// the panel is on screen all day. The text was also only readable during the
+// ~3s it rested at home; the rest of the cycle was motion you had to wait out.
+//
+// So instead of animating the overflow away, we remove it: an overlong branch is
+// shown as a cached 1-2 word summary that FITS. Nothing moves, the fast lane
+// stops repainting for names entirely (see animate), and the row is legible at
+// every instant rather than one instant in six.
+//
+// WHERE THE CACHE LIVES. ~/.cache/termdash, beside shortcut-summaries.json and
+// sentry-summaries.json, NOT a dotfile inside each worktree. A file in the
+// worktree would sit in the repo's working tree — needing a .gitignore entry in
+// a shared repo to avoid showing up in everyone's `git status` — and it would be
+// deleted by `worktree clean` exactly when the summary is still wanted (the row
+// outlives the checkout by one refresh). One file, greppable, survives the
+// worktree.
+//
+// Keyed by the FULL branch name, which is also the source text, so there is no
+// separate invalidation field like the other two caches carry: a renamed branch
+// is simply a new key. Stale keys are left alone rather than pruned — pruning
+// would need to know about every repo this panel has ever scanned, and the file
+// is a few hundred bytes.
+const CACHE_DIR = path.join(HOME, ".cache", "termdash");
+const BRANCH_SUMMARY_CACHE = path.join(CACHE_DIR, "branch-summaries.json");
+// Deliberately well under NAME_WIDTH (36). The point is not "fits" but "reads at
+// a glance", and 1-2 words is what the eye takes in without scanning.
+const BRANCH_SUMMARY_MAX = 24;
+const BRANCH_SUMMARY_TIMEOUT_MS = 30_000;
+// Same escape hatch as shortcut-peers.ts and morning-brief.ts.
+const SUMMARIES_ENABLED = process.env.TERMDASH_NO_LLM !== "1";
 
-// Marquee a branch name that overflows the window: show a `width`-char slice
-// that advances one char per animation frame, wrapping around with a small gap
-// so the tail and head don't visually collide. Names that fit are returned as-is.
+interface BranchSummaryEntry {
+  summary: string;
+  at: string;
+  // Which evidence the summary was written from: "sentry" | "pr" | "commits" | "name".
+  // Optional so a hand-edited entry stays valid without it.
+  from?: string;
+  // The Sentry issue this branch fixes, if any. Drives the △ glyph and its link.
+  sentry?: SentryRef;
+}
+
+function loadBranchSummaries(): Record<string, BranchSummaryEntry> {
+  try {
+    return JSON.parse(fs.readFileSync(BRANCH_SUMMARY_CACHE, "utf8")) as Record<
+      string,
+      BranchSummaryEntry
+    >;
+  } catch {
+    return {};
+  }
+}
+
+let branchSummaries: Record<string, BranchSummaryEntry> = loadBranchSummaries();
+let summariesInFlight = false;
+
+// Two branches off the same ticket genuinely can compress to the same words, and
+// two identical rows is a worse bug than a long name — you cannot tell which
+// worktree you are looking at. The model sees the whole batch at once and usually
+// separates them itself; this is the backstop for when it doesn't. Appends the
+// first word from the branch tail that the colliding summaries don't share.
+function disambiguate(pairs: Map<string, string>): Map<string, string> {
+  const bySummary = new Map<string, string[]>();
+  for (const [branch, summary] of pairs) {
+    const list = bySummary.get(summary) ?? [];
+    list.push(branch);
+    bySummary.set(summary, list);
+  }
+  for (const [summary, branches] of bySummary) {
+    if (branches.length < 2) continue;
+    for (const branch of branches) {
+      const have = new Set(summary.split(/\s+/));
+      const extra = branch
+        .split("/")
+        .pop()!
+        .split(/[-_.]/)
+        .filter((w) => w && !have.has(w.toLowerCase()));
+      const tag = extra.length ? extra[extra.length - 1].toLowerCase() : "";
+      if (tag) pairs.set(branch, truncate(`${summary} ${tag}`, BRANCH_SUMMARY_MAX));
+    }
+  }
+  return pairs;
+}
+
+// What the summary is actually written FROM.
 //
-// The cycle PAUSES at offset 0 — the name's first character flush against the left
-// of its window — for MARQUEE_HOLD_FRAMES before scrolling off again. Without the
-// pause the text slid continuously and you could never catch the start of a name
-// without waiting for exactly the right instant; the rest at home makes the
-// beginning the one position that's reliably readable.
+// The branch name alone is not enough and this panel has the counter-example
+// living in it: two branches off sc-176097 are named
+// `…follower-kpi-counts-timeout-for-hampton` and the same again `-social`. The
+// names differ by one token and say nothing about what either change DOES. So we
+// collect the artifacts that do:
 //
-// One shared `frame` drives every row, so all the marquees rest in step rather than
-// each pausing at its own moment.
-function marquee(name: string, width: number, frame: number): string {
-  if (name.length <= width) return name;
-  const track = name + "   "; // gap before it wraps back to the start
-  // Each full cycle is: hold at home, then one character-step per frame through the
-  // rest of the track, ending just before it would land back on home.
-  // The `+ 1` is why the scroll resumes at offset 1: without it, the first scrolling
-  // frame recomputes offset 0 and home is visibly held for HOLD_FRAMES + 1 frames.
-  // Cycle length is track.length - 1 + HOLD for the same reason — offsets 1..len-1
-  // are stepped through, and offset 0 is the held one.
-  const t = frame % (track.length - 1 + MARQUEE_HOLD_FRAMES);
-  const off = t < MARQUEE_HOLD_FRAMES ? 0 : t - MARQUEE_HOLD_FRAMES + 1;
-  return (track + track).slice(off, off + width);
+//   pr title/body  what the author told reviewers the change does. Highest
+//                  signal by a distance — it is a human sentence about the work.
+//   commit subjects the same thing in the author's own words before review, and
+//                  the only signal at all on a branch with no PR yet.
+//   worktree dir   `worktree -b` names the directory after the branch tail, but
+//                  a hand-made worktree is often named for the actual task
+//                  ("10AF-social-post-fk"), which is a real hint the branch lost.
+//   branch name    the fallback, and the thing we are trying to improve on.
+interface BranchEvidence {
+  branch: string;
+  dir: string;
+  prTitle?: string;
+  prBody?: string;
+  commits: string[];
+  storyType?: string; // Shortcut story_type — "bug" is a fix, full stop
+  sentry?: SentryRef;
+}
+
+// origin's default branch, per repo root. `worktree.zsh` resolves it the same
+// way and for the same reason: refs/remotes/origin/HEAD is a local pointer
+// written at clone time, so reading it costs nothing and needs no network.
+function defaultBase(wtPath: string): string {
+  try {
+    return execFileSync("git", ["-C", wtPath, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3000,
+    }).trim() || "origin/master";
+  } catch {
+    return "origin/master";
+  }
+}
+
+// ---- Sentry: is this branch a FIX, and what is it fixing? -----------------
+//
+// "Add" vs "fix" is not a wording choice, it is a fact about the work, and the
+// branch name never carries it — `follower-kpi-counts-timeout-for-hampton` reads
+// like a feature and is a production timeout. Two places state it outright:
+//
+//   1. The WORKTREE DIRECTORY prefix. Sentry-driven worktrees here are named
+//      `<sentry short-id suffix>-<slug>`: `10AF-social-post-fk`,
+//      `ZY0-follower-kpi-timeout`. This is checked FIRST and wins, because it is
+//      per-worktree — the two branches off sc-176097 are two DIFFERENT Sentry
+//      issues (10AF and ZY0) and the shared story only names one of them.
+//   2. The Shortcut story. A ticket filed from Sentry opens with a literal
+//      `Sentry Issue: [SHORT-ID](url)` line, and its story_type is `bug`.
+//
+// Path 1 needs a guard, because a directory prefix is just a directory prefix:
+// `p4-defer-…` and `AIM-2.0-Planning` would otherwise be looked up as short ids.
+// Requiring 3-6 uppercase alphanumerics WITH at least one digit rejects `AIM`,
+// `P4` and `LLM` before any request, and the API rejects the rest — all three of
+// those return 404 when tried, which is the belt to this braces.
+interface SentryRef {
+  shortId: string;
+  title: string;
+  culprit?: string;
+  url: string;
+}
+
+const sentryRefCache = new Map<string, SentryRef | null>(); // short id → ref (null = looked up, absent)
+
+// The suffix a worktree directory is named after, or undefined if the prefix does
+// not look like one. Uppercased so `10af-…` still matches.
+function sentrySuffixFromDir(dir: string): string | undefined {
+  const m = dir.match(/^([A-Za-z0-9]{3,6})-/);
+  if (!m) return undefined;
+  const suffix = m[1].toUpperCase();
+  return /\d/.test(suffix) && /^[A-Z0-9]+$/.test(suffix) ? suffix : undefined;
+}
+
+async function sentryLookup(shortId: string): Promise<SentryRef | null> {
+  if (sentryRefCache.has(shortId)) return sentryRefCache.get(shortId)!;
+  let ref: SentryRef | null = null;
+  if (SENTRY_TOKEN) {
+    try {
+      const res = await fetch(`${SENTRY_API}/organizations/${SENTRY_ORG}/shortids/${shortId}/`, {
+        headers: { Authorization: `Bearer ${SENTRY_TOKEN}` },
+      });
+      if (res.ok) {
+        const d = (await res.json()) as { shortId?: string; group?: { title?: string; culprit?: string; permalink?: string } };
+        const g = d.group ?? {};
+        if (g.title) {
+          ref = {
+            shortId: d.shortId ?? shortId,
+            title: g.title,
+            culprit: g.culprit,
+            url: g.permalink ?? `https://${SENTRY_ORG}.sentry.io/issues/?query=${encodeURIComponent(shortId)}`,
+          };
+        }
+      }
+    } catch {
+      /* network blip — cache nothing so the next attempt retries */
+      return null;
+    }
+  }
+  sentryRefCache.set(shortId, ref);
+  return ref;
+}
+
+// Try the directory prefix against each project, then fall back to whatever the
+// Shortcut story names. Returns undefined when the branch has no Sentry issue,
+// which is the common case and must stay free of network calls — hence the
+// suffix guard running before anything is fetched.
+async function resolveSentry(w: Worktree): Promise<SentryRef | undefined> {
+  const suffix = sentrySuffixFromDir(path.basename(w.wtPath));
+  if (suffix) {
+    for (const prefix of SENTRY_PROJECT_PREFIXES) {
+      const ref = await sentryLookup(`${prefix}-${suffix}`);
+      if (ref) return ref;
+    }
+  }
+  const id = shortcutId(w.branch);
+  const desc = id ? scStoryCache.get(id)?.description : undefined;
+  const m = desc?.match(/Sentry Issue:\s*\[([A-Z0-9-]+)\]\((https?:\/\/[^)\s]+)\)/i);
+  if (m) {
+    const ref = await sentryLookup(m[1].toUpperCase());
+    // Even if the lookup fails (token missing, issue deleted) the story told us
+    // the id and the url, which is enough for the glyph and its link.
+    return ref ?? { shortId: m[1].toUpperCase(), title: "", url: m[2] };
+  }
+  return undefined;
+}
+
+// ---- architecture review ---------------------------------------------------
+
+type ArchState = "needed" | "approved";
+
+function escapeRe(t: string): string {
+  return t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// One CODEOWNERS pattern -> a RegExp over repo-relative paths. gitignore-ish
+// semantics, and only the subset this file actually uses:
+//   leading /            anchor to the repo root
+//   a / anywhere else    also anchors (CODEOWNERS treats `config/x` as rooted)
+//   no / at all          match the basename at any depth (`.snyk`, `knip.js`)
+//   trailing /           a directory: everything beneath it
+//   *                    one path segment's worth of anything
+function codeownersRegex(pattern: string): RegExp {
+  let p = pattern.trim();
+  const anchored = p.startsWith("/") || p.replace(/\/$/, "").includes("/");
+  if (p.startsWith("/")) p = p.slice(1);
+  const isDir = p.endsWith("/");
+  if (isDir) p = p.replace(/\/$/, "");
+  const body = p
+    .split("/")
+    .map((seg) => seg.split("*").map(escapeRe).join("[^/]*"))
+    .join("/");
+  return new RegExp(`${anchored ? "^" : "(^|/)"}${body}${isDir ? "/.*" : "(/.*)?"}$`);
+}
+
+// Parsed once per process per repo. CODEOWNERS changes about as often as the
+// team does, and a stale read costs one wrong glyph until the panel restarts.
+const archPatternCache = new Map<string, RegExp[]>();
+
+function archPatterns(repoDir: string): RegExp[] {
+  const hit = archPatternCache.get(repoDir);
+  if (hit) return hit;
+  let out: RegExp[] = [];
+  try {
+    out = fs
+      .readFileSync(path.join(repoDir, ".github", "CODEOWNERS"), "utf8")
+      .split("\n")
+      .map((l) => l.replace(/#.*$/, "").trim())
+      .filter((l) => l && l.includes(ARCH_TEAM))
+      .map((l) => codeownersRegex(l.split(/\s+/)[0]))
+      .filter(Boolean);
+  } catch {
+    /* no CODEOWNERS in this repo — nothing is architecture-gated */
+  }
+  archPatternCache.set(repoDir, out);
+  return out;
+}
+
+// COMMITTED changes only — `<base>...HEAD`, not the working tree.
+//
+// The first version unioned in `git diff --name-only HEAD` on the theory that a
+// migration you have written but not committed already needs the review. In this
+// repo that is wrong, and measurably so: a bare `rails db:migrate` rewrites
+// `db/schema.rb` as a side effect (the mirror-schema churn `pm-schema-reconcile`
+// exists to undo), so three of five worktrees had a dirty schema.rb, none of them
+// had committed it, and every one of them lit the marker. A gate that fires on
+// almost every row is not a gate.
+//
+// Committed-only also matches what the marker MEANS. The question is "will this
+// PR need architecture approval", and an uncommitted file is not in the PR — nor
+// can anyone review it.
+function changedFiles(wtPath: string): string[] {
+  try {
+    return execFileSync("git", ["-C", wtPath, "diff", "--name-only", `${defaultBase(wtPath)}...HEAD`], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
+    })
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+  } catch {
+    return []; // missing base ref or a worktree mid-removal
+  }
+}
+
+// Members of @Popmenu/architecture, resolved once per process. Used only to tell
+// "still needed" from "already approved" — without it every gated row would read
+// as outstanding forever, which is worse than not marking it at all.
+let archMembers: Set<string> | null = null;
+
+function architectureMembers(): Set<string> {
+  if (archMembers) return archMembers;
+  archMembers = new Set();
+  try {
+    const out = execFileSync("gh", ["api", `/orgs/${ARCH_TEAM_API}/members`, "--jq", ".[].login"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 8000,
+    });
+    for (const l of out.split("\n")) if (l.trim()) archMembers.add(l.trim().toLowerCase());
+  } catch {
+    /* no org read scope — everything gated stays "needed", which is the safe read */
+  }
+  return archMembers;
+}
+
+// Worktree -> "owner/repo", via the REPOS entry it was scanned from. Worktree.repo
+// is the basename of that dir, which is the join.
+function githubRepoFor(w: Worktree): string | null {
+  const entry = REPOS.find((r) => path.basename(r.dir) === w.repo);
+  return entry?.slug ? githubRepo(entry.slug) : null;
+}
+
+// Every non-main branch wants a summary now, not just the ones that overflow, so
+// "needs one" is simply "hasn't got one".
+function needsSummary(worktrees: Worktree[]): boolean {
+  return worktrees.some((w) => !w.isMain && !branchSummaries[w.branch]);
+}
+
+async function collectEvidence(w: Worktree): Promise<BranchEvidence> {
+  const ev: BranchEvidence = { branch: w.branch, dir: path.basename(w.wtPath), commits: [] };
+
+  try {
+    ev.commits = execFileSync(
+      "git",
+      ["-C", w.wtPath, "log", "--format=%s", "-n", "6", `${defaultBase(w.wtPath)}..HEAD`],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }
+    )
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+  } catch {
+    /* detached, missing base ref, or a worktree that just vanished */
+  }
+
+  // Only where a PR can exist. An unpushed branch has none by definition, and
+  // this saves a ~700ms `gh` round-trip per spike worktree.
+  const ghRepo = githubRepoFor(w);
+  if (w.pushed && ghRepo) {
+    try {
+      const out = execFileSync(
+        "gh",
+        ["pr", "list", "--repo", ghRepo, "--head", w.branch, "--state", "all",
+         "--json", "title,body", "--limit", "1", "--jq", '.[0] // empty'],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 }
+      ).trim();
+      if (out) {
+        const o = JSON.parse(out) as { title?: string; body?: string };
+        ev.prTitle = o.title?.trim() || undefined;
+        // First few lines only. A Popmenu PR body carries a template, a test
+        // plan and screenshots; the description is at the top and the rest is
+        // noise that would dominate the prompt.
+        ev.prBody = o.body?.split("\n").slice(0, 6).join(" ").trim().slice(0, 400) || undefined;
+      }
+    } catch {
+      /* gh missing, unauthed, or rate-limited — the other evidence still stands */
+    }
+  }
+  const id = shortcutId(w.branch);
+  ev.storyType = id ? scStoryCache.get(id)?.type : undefined;
+  ev.sentry = await resolveSentry(w);
+  return ev;
+}
+
+function renderEvidence(ev: BranchEvidence): string {
+  const lines = [`BRANCH: ${ev.branch}`, `  worktree dir: ${ev.dir}`];
+  // Sentry first: it is the single most decisive line in the block, because it
+  // settles "fix or feature" before the model reads anything else.
+  if (ev.sentry) {
+    lines.push(`  SENTRY ISSUE ${ev.sentry.shortId} — THIS BRANCH IS A BUG FIX`);
+    if (ev.sentry.title) lines.push(`    error: ${ev.sentry.title.slice(0, 200)}`);
+    if (ev.sentry.culprit) lines.push(`    culprit: ${ev.sentry.culprit}`);
+  }
+  if (ev.storyType) lines.push(`  shortcut story type: ${ev.storyType}`);
+  if (ev.prTitle) lines.push(`  pr title: ${ev.prTitle}`);
+  if (ev.prBody) lines.push(`  pr description: ${ev.prBody}`);
+  for (const c of ev.commits) lines.push(`  commit: ${c}`);
+  if (!ev.prTitle && !ev.commits.length) lines.push(`  (no PR and no commits yet — name and dir only)`);
+  return lines.join("\n");
+}
+
+// Ask `claude` for a 1-2 word ACTION summary of each branch. Returns true when it
+// wrote something new, so the caller knows to repaint.
+//
+// One batch, all branches: cheaper than N calls, and it is what lets the model
+// tell two near-identical branches apart in the first place.
+async function ensureBranchSummaries(worktrees: Worktree[]): Promise<boolean> {
+  const missing = worktrees.filter((w) => !w.isMain && !branchSummaries[w.branch]);
+  if (!missing.length || !SUMMARIES_ENABLED) return false;
+
+  const evidence = await Promise.all(missing.map(collectEvidence));
+
+  const prompt = [
+    `Summarise what each git branch DOES, in 1-2 words.`,
+    ``,
+    `This is for a status panel where the summary REPLACES the branch name, so it`,
+    `has to say what the change does, not what area it touches.`,
+    ``,
+    `Rules:`,
+    `- 1-2 words. Hard limit ${BRANCH_SUMMARY_MAX} characters.`,
+    `- ACTION FIRST. Lead with the verb describing the change: "fix social posts",`,
+    `  "optimize kpi counts", "defer slack alert". NOT "social posts", NOT`,
+    `  "kpi counts" — a bare noun does not distinguish adding a thing from`,
+    `  deleting it.`,
+    `- A branch with a SENTRY ISSUE, or a Shortcut story type of "bug", is a FIX.`,
+    `  Start it with "fix" and name what is broken, taken from the Sentry error`,
+    `  and culprit. This OVERRIDES the PR title: a PR called "Add Follower Counts`,
+    `  to KPI Metrics" that carries a Sentry timeout is "fix kpi timeout", because`,
+    `  the adding is how the fix was done, not what the branch is for.`,
+    `- Weight the evidence: the PR title and description say what the change does`,
+    `  and are the best source. Commit subjects come next. The worktree directory`,
+    `  name is a hint about intent. The BRANCH NAME IS THE WEAKEST SIGNAL — it is`,
+    `  often stale, copied from a sibling branch, or names the ticket rather than`,
+    `  the work. Do not just re-word the branch name if better evidence exists.`,
+    `- Drop the owner prefix (steele/), the ticket id (sc-176097), and filler:`,
+    `  wip, p1, p2, p4.`,
+    `- If two branches would summarise the same, keep whatever token tells them`,
+    `  apart, even if that costs a third word.`,
+    `- Lower case, single spaces. No trailing period, no quotes, no emoji.`,
+    ``,
+    `Return ONLY a JSON object mapping the FULL branch name to its summary, no`,
+    `prose and no code fence.`,
+    ``,
+    ...evidence.map(renderEvidence),
+  ].join("\n");
+
+  let raw: string;
+  try {
+    // cwd is a temp dir on purpose: run from this repo and the CLI loads the
+    // project's settings and skills, which costs startup time and context for a
+    // task that needs neither. (Lifted from shortcut-peers.ts, which lifted it
+    // from morning-brief.ts.)
+    raw = execFileSync("claude", ["-p", prompt], {
+      encoding: "utf8",
+      timeout: BRANCH_SUMMARY_TIMEOUT_MS,
+      cwd: os.tmpdir(),
+      stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: 4 * 1024 * 1024,
+    });
+  } catch {
+    return false; // claude missing, unauthenticated or slow — names show instead
+  }
+
+  let parsed: Record<string, string>;
+  try {
+    const m = raw.match(/\{[\s\S]*\}/); // tolerate a stray fence or preamble
+    parsed = m ? (JSON.parse(m[0]) as Record<string, string>) : {};
+  } catch {
+    return false;
+  }
+
+  const fresh = new Map<string, string>();
+  for (const w of missing) {
+    const v = (parsed[w.branch] ?? "").trim().toLowerCase();
+    if (v) fresh.set(w.branch, truncate(v, BRANCH_SUMMARY_MAX));
+  }
+  if (!fresh.size) return false;
+  disambiguate(fresh);
+
+  const now = new Date().toISOString();
+  for (const [branch, summary] of fresh) {
+    const ev = evidence.find((e) => e.branch === branch);
+    branchSummaries[branch] = {
+      summary,
+      at: now,
+      // What it was written from, so a summary that reads wrong can be traced to
+      // thin evidence rather than to the model. Also what tells you a re-run
+      // would help: a "name" row gets better the moment a PR exists.
+      from: ev?.sentry ? "sentry" : ev?.prTitle ? "pr" : ev?.commits.length ? "commits" : "name",
+      // Persisted so the △ and its link survive a restart. The glyph would
+      // otherwise vanish until the next slow tick re-resolved it, and a glyph
+      // that blinks in and out reads as a bug.
+      sentry: ev?.sentry,
+    };
+  }
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(BRANCH_SUMMARY_CACHE, JSON.stringify(branchSummaries, null, 2));
+  } catch {
+    /* a cache we could not write just means we regenerate next time */
+  }
+  return true;
+}
+
+// What actually goes in the name column: the summary, always, for every branch
+// that has one. NOT a fit-based fallback — a panel where some rows say what the
+// work does and others carry a raw branch name reads as two different columns,
+// and the raw name is the thing the summary exists to improve on even when it
+// happens to fit.
+//
+// The main checkout is exempt: "master" is not a unit of work and there is
+// nothing to summarise. Everything else falls back to the fitted branch name
+// while its summary is still being written, and forever under TERMDASH_NO_LLM=1.
+function displayBranch(w: Worktree, width: number): string {
+  const summary = w.isMain ? undefined : branchSummaries[w.branch]?.summary;
+  return truncate(summary ?? fitBranch(w.branch, width), width);
 }
 
 function render(worktrees: Worktree[], err: Error | null, frame: number): void {
   process.stdout.write("\x1b[3J\x1b[2J\x1b[H"); // clear scrollback + screen + home
 
-  // Header kept to just the title — the "updated / refresh cadence" readout was
-  // noise (refresh is silent-and-frequent). The freed space on this line is
-  // reserved for something useful later.
-  console.log(`${BOLD}Worktrees${RESET}`);
-  if (!CIRCLECI_TOKEN) {
-    console.log(`${YELLOW}⚠ no CIRCLECI_TOKEN — CI dots stay gray${RESET}`);
-  }
+  // No header at all — no title, no leading rule. The pane is identified by its
+  // position in the layout and by what is in it, and in a pane this short the
+  // most expensive chrome on screen is the row that carries no worktree. The
+  // section rules below are the only structure the list needs.
   const sepWidth = process.stdout.columns || 24;
-  console.log(DIM + "─".repeat(sepWidth) + RESET);
+  if (!CIRCLECI_TOKEN) {
+    console.log(`${YELLOW}⚠ no CIRCLE_CI_TOKEN — CI dots stay gray${RESET}`);
+  }
 
   if (err) {
     console.log(`${RED}Error:${RESET} ${err.message}`);
@@ -1215,20 +1899,40 @@ function render(worktrees: Worktree[], err: Error | null, frame: number): void {
   const branchMax = Math.max(10, sepWidth - 17);
   const nameW = nameWindow(sepWidth);
 
+  // Section rules are drawn only BETWEEN sections, never leading or trailing:
+  // with no header above and no footer below, a bracketing rule would be a row
+  // spent on nothing. No section labels either — the rule alone carries the split,
+  // and three headings would eat a pane that is mostly rows. Relies on gather()
+  // returning each group contiguously.
+  let prevSection: Section | null = null;
+
   for (const w of worktrees) {
-    // Fit the branch to the window (restoring prefix context when it fits) and
-    // marquee it if the tail still overflows. NOT padded here — we pad after the
-    // dev marker (below) so the marker hugs the name's right edge instead of
-    // floating out at the fixed column.
-    const nameText = marquee(fitBranch(w.branch, nameW), nameW, frame);
+    const section = sectionOf(w);
+    if (prevSection !== null && section !== prevSection) {
+      console.log(DIM + "─".repeat(sepWidth) + RESET);
+    }
+    prevSection = section;
+
+    // Fit the branch to the window (restoring prefix context when it fits), and
+    // fall back to its cached 1-2 word summary when the tail still overflows.
+    // NOT padded here — we pad after the dev marker (below) so the marker hugs
+    // the name's right edge instead of floating out at the fixed column.
+    const nameText = displayBranch(w, nameW);
     const dim = w.agentState === "none";
     const styled = dim ? `${GRAY}${nameText}${RESET}` : `${BOLD}${nameText}${RESET}`;
-    // ?windowId=_blank forces Cursor to open a NEW window on this worktree.
-    // Without it, cursor://file/<folder> routes to the last-focused window of
-    // the same repo — so clicking a closed worktree would try to switch THAT
-    // window's branch (prompting "confirm switch") instead of opening this one.
-    // As a bonus, the fresh window restores that worktree's saved agent chat.
-    const nameLink = link(styled, `cursor://file/${w.wtPath}?windowId=_blank`);
+    // Cmd-click the branch name → that worktree's Space in Herdr, which is where
+    // the work actually happens. Falls back to Cursor where HerdrOpen.app isn't
+    // installed (see HERDR_LINKS).
+    //
+    // On the Cursor fallback, ?windowId=_blank forces a NEW window on this
+    // worktree. Without it, cursor://file/<folder> routes to the last-focused
+    // window of the same repo — so clicking a closed worktree would try to switch
+    // THAT window's branch (prompting "confirm switch") instead of opening this
+    // one. As a bonus, the fresh window restores that worktree's saved agent chat.
+    const nameLink = link(
+      styled,
+      HERDR_LINKS ? herdrSpaceUrl(w.wtPath) : `cursor://file/${w.wtPath}?windowId=_blank`,
+    );
 
     // CI dot links to the workflow if we have a URL; otherwise it's a plain dot.
     const dot = w.ci.url ? webLink(ciDot(w.ci.status), w.ci.url) : ciDot(w.ci.status);
@@ -1242,7 +1946,7 @@ function render(worktrees: Worktree[], err: Error | null, frame: number): void {
     const bare = w.isMain;
 
     // PR-approval progress (✓✓ / ✓· / ··), fixed width, between the dot and glyph.
-    const approvals = bare ? " ".repeat(APPROVALS_NEEDED) : approvalsSlot(w.approvals);
+    const approvals = bare ? " ".repeat(APPROVALS_NEEDED) : approvalsSlot(w.approvals, w.arch);
 
     // git glyph between the approvals and the name → the branch's GitHub PR.
     // Blank on master: the only link we could offer is a head:master PR search,
@@ -1256,11 +1960,30 @@ function render(worktrees: Worktree[], err: Error | null, frame: number): void {
     const scUrl = bare ? undefined : shortcutUrl(w.branch);
     const sc = scUrl ? webLink(`${scColor(w.scTier)}${SC_GLYPH} ${RESET}`, scUrl) : "  ";
 
+    // Sentry glyph, right of the story glyph → the production error this branch
+    // fixes. Present only on branches that HAVE one, which is what makes it worth
+    // a column: it separates "this is a fix" from "this is a feature" at a glance,
+    // and the summary beside it already says so in words.
+    //
+    // Read from the branch-summaries cache rather than resolved per frame — the
+    // lookup is a network call, and the row must draw at 5s intervals whether or
+    // not Sentry is reachable. Same trailing-space-inside-the-link trick as the
+    // glyphs above, so the cmd-click target is 2 cells wide.
+    const sentryRef = bare ? undefined : branchSummaries[w.branch]?.sentry;
+    const sentry = sentryRef
+      ? webLink(`${SENTRY_VIOLET}${SENTRY_GLYPH} ${RESET}`, sentryRef.url)
+      : "  ";
+
     // hubdiff glyph → this worktree's diff. Same trailing-space-inside-the-link
     // trick as the glyphs above, so the click target is 2 cells wide. Blank on
     // master — it's the baseline the other rows diff against, so "its diff" is empty
     // by definition.
-    const diff = bare ? "  " : webLink(`${WHITE}${DIFF_GLYPH} ${RESET}`, hubdiffUrl(w.wtPath));
+    //
+    // `link`, NOT `webLink`: webLink exists to route http links through the
+    // `termdash:` tab-reuse handler, and a `hubdiff:` URL must reach macOS
+    // LaunchServices raw so the native app gets it. Wrapping it would hand the
+    // diff back to Chrome — the exact thing this link is here to avoid.
+    const diff = bare ? "  " : link(`${WHITE}${DIFF_GLYPH} ${RESET}`, hubdiffUrl(w.wtPath));
 
     // No "×N" session counter: a row is one agent — the newest session for that
     // worktree (see newestAgentFor). The count inflated the row for no decision it
@@ -1281,13 +2004,20 @@ function render(worktrees: Worktree[], err: Error | null, frame: number): void {
     // in one column across every row — only where the slack sits changes.
     // Odd slack gives the extra cell to the RIGHT, so a name sits one cell left of
     // true centre rather than drifting into the agent glyph.
-    // Names long enough to marquee fill the window exactly, so they have no slack to
-    // split and are unaffected; this is really about the short ones (master).
+    // A name that had to be truncated fills the window exactly, so it has no slack
+    // to split and is unaffected; this is really about the short ones (master) and
+    // the summaries, which are deliberately well short of the window.
     const slack = Math.max(0, nameW + 2 - nameText.length - devWidth);
     const padL = " ".repeat(Math.floor(slack / 2));
     const padR = " ".repeat(slack - Math.floor(slack / 2));
 
-    console.log(`${dot} ${approvals} ${git} ${sc}${diff}${padL}${nameLink}${dev}${padR} ${agentGlyph(w.agentState, frame)}`);
+    // STATUS on the left, GLYPHS on the right, name between them. The split is
+    // by what the cell is FOR, not by what it looks like: everything left of the
+    // name is a state you read, everything right of it is a cmd-click target you
+    // act on. Previously the two were interleaved (dot, approvals, then the four
+    // link glyphs, then the name, then the agent), so the eye had to sort them
+    // apart on every row.
+    console.log(`${dot} ${approvals} ${agentSlot(w.agentState, frame)}  ${padL}${nameLink}${dev}${padR}  ${git}${sc}${sentry}${diff}`);
 
     // Under a failing branch, list each failed job indented, hyperlinked to its
     // own CircleCI job page (the dot links the workflow; these drill to the job).
@@ -1302,24 +2032,11 @@ function render(worktrees: Worktree[], err: Error | null, frame: number): void {
     }
   }
 
-  console.log(DIM + "─".repeat(sepWidth) + RESET);
-
-  const ci = (pred: (s: CiStatus) => boolean) => worktrees.filter((w) => pred(w.ci.status)).length;
-  const passing = ci((s) => s === "success");
-  const ciRun = ci((s) => s === "running" || s === "on_hold");
-  const failing = ci(isFailing);
-  // "CI" padded to the width of "Agents" so the two summary rows line up.
-  console.log(
-    `${DIM}CI    ${RESET}  ${GREEN}${passing} pass${RESET}  ${YELLOW}${ciRun} run${RESET}  ${RED}${failing} fail${RESET}`
-  );
-
-  const ag = (s: AgentState) => worktrees.filter((w) => w.agentState === s).length;
-  // "attn" = a pending question (waiting) — yellow, matching Cursor's own
-  // waiting flag and the !! glyph. Broken out from "err" (a failed turn) so a
-  // question is unmistakable.
-  console.log(
-    `${DIM}Agents${RESET}  ${GREEN}${ag("done")} done${RESET}  ${YELLOW}${ag("running")} run${RESET}  ${BOLD}${YELLOW}${ag("waiting")} attn${RESET}  ${RED}${ag("error")} err${RESET}  ${GRAY}${ag("none")} idle${RESET}`
-  );
+  // No CI/Agents tally footer. Both counts restated what the rows already show —
+  // every ● dot and every agent glyph is on screen directly above — and they cost
+  // three rows (the two tallies plus the rule dividing them from the rows) in a
+  // pane whose whole constraint is vertical space. The closing rule went with
+  // them: a separator with nothing beneath it is just a spent row.
 }
 
 // Latest gathered worktrees + the animation frame, shared between the data loop
@@ -1347,6 +2064,30 @@ function loop(): void {
   } catch (e) {
     render([], e as Error, animFrame);
   }
+
+  // Summary lane: fire-and-forget, exactly like the slow lane above. A new
+  // worktree shows its name truncated for one `claude` round-trip and then
+  // settles into its summary — the panel never blocks on this, and a failure
+  // costs a truncated name rather than a frame.
+  //
+  // Driven from the poll rather than from a hook in `worktree` creation on
+  // purpose: worktrees also arrive by `git worktree add`, by a teammate's
+  // script, or from Herdr's own new-worktree flow, and a create-time hook sees
+  // none of those. Polling for missing keys catches every path for free.
+  if (!summariesInFlight) {
+    if (needsSummary(lastWorktrees)) {
+      summariesInFlight = true;
+      ensureBranchSummaries(lastWorktrees)
+        .then((wrote) => {
+          if (wrote) render(lastWorktrees, null, animFrame);
+        })
+        .catch(() => {})
+        .finally(() => {
+          summariesInFlight = false;
+        });
+    }
+  }
+
   setTimeout(loop, AGENT_REFRESH_SECONDS * 1000);
 }
 
@@ -1355,13 +2096,12 @@ function loop(): void {
 // running, so an idle panel doesn't flicker between data ticks.
 function animate(): void {
   animFrame++;
-  // Re-render on the fast tick when either the running glyph needs to advance
-  // OR a branch name is long enough to marquee — otherwise an idle panel with
-  // only short names stays static (no flicker between data ticks).
-  const win = nameWindow(process.stdout.columns || 24);
-  const running = lastWorktrees.some((w) => w.agentState === "running");
-  const scrolling = lastWorktrees.some((w) => fitBranch(w.branch, win).length > win);
-  if (running || scrolling) {
+  // Re-render on the fast tick ONLY when a running glyph needs to advance. Branch
+  // names used to force this too, because a long one marqueed — which meant one
+  // overlong name repainted the whole panel twice a second for as long as it
+  // existed. Summaries are static, so a panel with no running agent now draws
+  // exactly once per data tick and holds still.
+  if (lastWorktrees.some((w) => w.agentState === "running")) {
     render(lastWorktrees, null, animFrame);
   }
   setTimeout(animate, ANIM_INTERVAL_MS);
@@ -1369,17 +2109,49 @@ function animate(): void {
 
 // ---- entry ----
 
-if (process.argv.includes("--mock")) {
+// `--summarize` fills the cache for every branch that hasn't got a summary,
+// prints the result with the evidence each one was written from, and exits
+// without starting the panel. The one-shot form of the summary lane in loop().
+// `--force` re-summarises branches that already have an entry — what you run
+// after a PR lands on a branch that previously had only its name to go on.
+if (process.argv.includes("--summarize")) {
+  void (async () => {
+    const width = nameWindow(Number(process.env.COLUMNS) || process.stdout.columns || 54);
+    const worktrees = gather();
+    if (process.argv.includes("--force")) {
+      for (const w of worktrees) delete branchSummaries[w.branch];
+    }
+    const pending = worktrees.filter((w) => !w.isMain && !branchSummaries[w.branch]);
+    console.log(`name column is ${width} cols; summarising ${pending.length} branch(es)\n`);
+    if (pending.length) await ensureBranchSummaries(worktrees);
+
+    for (const w of worktrees) {
+      const shown = displayBranch(w, width);
+      // `from` says which evidence won, which is the difference between "this
+      // summary is wrong" and "this branch has nothing to summarise yet".
+      const entry = w.isMain ? undefined : branchSummaries[w.branch];
+      const from = w.isMain ? "main" : (entry?.from ?? "none");
+      const sid = entry?.sentry ? `${SENTRY_GLYPH} ${entry.sentry.shortId}` : "";
+      console.log(`  ${shown.padEnd(width)}  ${from.padEnd(8)} ${sid.padEnd(24)} ${DIM}${w.branch}${RESET}`);
+    }
+    console.log(`\ncache: ${BRANCH_SUMMARY_CACHE}`);
+  })();
+} else if (process.argv.includes("--mock")) {
   const t = Date.now();
   render(
     [
+      // Ordered the way gather() now returns rows — main, then ticketed (sc-<id>),
+      // then spikes/projects — so --mock previews the section rules honestly. Rows
+      // interleaved across sections would draw a rule between nearly every line.
+      //
       // main checkout: CI dot + name only, pinned first (see gather/render `isMain`).
-      // Listed first here too so --mock matches the order gather() produces.
       { repo: "popmenu", wtPath: "/popmenu", branch: "master", agent: { uuid: "z", mtime: t - 60_000, state: "done", closed: true }, isMain: true, mtime: t - 60_000, agentState: "done", ci: { status: "failed", url: "https://ci-master" }, prUrl: "https://github.com/Popmenu/popmenu/pulls?q=head%3Amaster", approvals: 2, merged: false, pushed: true, devRunning: false },
-      { repo: "popmenu", wtPath: "/x", branch: "steele/migrate-shortcut", agent: { uuid: "a", mtime: t - 5_000, state: "done", closed: false }, mtime: t - 5_000, agentState: "running", ci: { status: "running", url: "https://x" }, prUrl: "https://github.com/Popmenu/popmenu/pulls?q=is%3Apr+head%3Asteele%2Fmigrate-shortcut", approvals: 1, merged: false, pushed: false, isMain: false, devRunning: true },
+      // ── ticketed work
       { repo: "popmenu", wtPath: "/y", branch: "steele/sc-170267/list-list-enumerate-clean-up-items-for-text", agent: { uuid: "b", mtime: t - 120_000, state: "done", closed: false }, mtime: t - 120_000, agentState: "waiting", ci: { status: "success", url: "https://y" }, prUrl: "https://github.com/Popmenu/popmenu/pulls?q=is%3Apr+head%3Asteele%2Fsc-170267", approvals: 2, merged: false, pushed: true, isMain: false, devRunning: false },
       { repo: "popmenu", wtPath: "/z", branch: "steele/sc-170112/fix-webhook-retry", agent: { uuid: "d", mtime: t - 480_000, state: "error", closed: true, note: "aborted" }, mtime: t - 480_000, agentState: "error", ci: { status: "failed", url: "https://z" }, prUrl: "https://github.com/Popmenu/popmenu/pulls?q=is%3Apr+head%3Asteele%2Fsc-170112", approvals: 0, merged: false, pushed: true, isMain: false, devRunning: false },
       { repo: "popmenu", wtPath: "/m", branch: "steele/sc-169044/already-merged-cleanup", agent: { uuid: "e", mtime: t - 900_000, state: "done", closed: true }, mtime: t - 900_000, agentState: "done", ci: { status: "success", url: "https://m" }, prUrl: "https://github.com/Popmenu/popmenu/pull/12345", approvals: 2, merged: true, pushed: false, isMain: false, devRunning: false },
+      // ── spikes / projects (no sc- id)
+      { repo: "popmenu", wtPath: "/x", branch: "steele/migrate-shortcut", agent: { uuid: "a", mtime: t - 5_000, state: "done", closed: false }, mtime: t - 5_000, agentState: "running", ci: { status: "running", url: "https://x" }, prUrl: "https://github.com/Popmenu/popmenu/pulls?q=is%3Apr+head%3Asteele%2Fmigrate-shortcut", approvals: 1, merged: false, pushed: false, isMain: false, devRunning: true },
       { repo: "term-dash", wtPath: "/w", branch: "steele/worktree-panel", mtime: 0, agentState: "none", ci: { status: "unknown" }, approvals: 0, merged: false, pushed: false, isMain: false, devRunning: false },
     ],
     null,
