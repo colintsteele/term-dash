@@ -695,6 +695,47 @@ launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.colinsteele.morning-brie
 The hook and keybinding are installed by `termdash up`, so an already-running
 session needs a `termdash restart` (or one manual `tmux set-hook`) to pick them up.
 
+#### The Chrome page (replacing the popup)
+
+Every build of the brief (`--write`, `--fresh`, `--cached`, `--html`) also writes
+a self-contained page to `~/.cache/termdash/brief/today.html` (dated copies sit
+beside it). It's a to-do list rather than a delta: the things waiting on you come
+first, the agenda is a sidebar, and every row is a link.
+
+| Section | What's in it |
+|---|---|
+| Reviews you owe | the REVIEWS section above |
+| Your PRs | your open PRs, in order of whose move it is: `CI RED` → `CHANGES` → `CONFLICT` → `MERGE IT`; ones waiting on reviewers and drafts are folded away |
+| Talking to you in Shortcut | comments since the window opened that @-mention you or sit on a story you own |
+| Sentry | the SENTRY section above, with the folded-away groups as one line each |
+| New on the Marketeers board | team stories created since the window opened that you don't own; missing estimates and owners shown in red |
+| Your stories | started and blocked stories; the rest folded away |
+
+Shortcut has no notifications API, and its search silently ignores `comment:`
+and `mention:`, so "talking to you" is worked out by reading the comments on
+team stories and your own stories. A mention on another team's story that you
+don't own is **not** caught.
+
+`brief-open` puts the page in front of you: it finds a Chrome tab already
+showing it (or opens one), reloads it, raises that window, centers it on the
+primary display and activates Chrome. It finds the tab itself because tabjump
+ignores `file://` URLs. It reaches Chrome **by process ID**, picking the one Chrome
+process with no `--user-data-dir`. Playwright launches signed-out copies of
+the same app, and `tell application "Google Chrome"` would pick any of them. `bin/unlock-watch`
+runs it on each screen unlock. With `--if-unseen` it only acts once a day (every
+day, weekends included), after 06:00, and builds the brief first if the 06:00 job hasn't run.
+
+```sh
+./build-unlock-watch.sh
+./brief-open        # once by hand, to answer macOS's "control Google Chrome?" prompt
+ln -sf "$PWD/com.colinsteele.brief-unlock.plist" ~/Library/LaunchAgents/
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.colinsteele.brief-unlock.plist
+```
+
+Expect a second Automation prompt, naming unlock-watch, the first time it fires
+on its own. The log is `~/.cache/termdash/brief-unlock.log`. To remove it, run
+`launchctl bootout gui/$UID/com.colinsteele.brief-unlock`.
+
 > **`git-notiql2.ts`** is an alternate build of the PR widget that adds a
 > Shortcut-driven "NEEDS REVIEW" category (open team PRs you haven't reviewed).
 > It's not wired into the default layout — point `RIGHT_TOP_CMD` at it in

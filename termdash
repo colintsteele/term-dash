@@ -18,11 +18,15 @@
 #   termdash down      kill the dashboard session
 #   termdash restart   down, then up
 #   termdash status    show what's running in each pane
-#   termdash brief       pop today's CACHED brief over the layout (also prefix+b)
-#   termdash brief-fresh rebuild it from nothing first, then pop (also prefix+B)
+#   termdash brief       bring the brief's Chrome page forward (also prefix+b)
+#   termdash brief-fresh rebuild it from nothing first, then bring it forward
+#                        (also prefix+B)
+#   termdash brief-popup the old text brief, popped over the layout
 #   termdash brief-now   render to stdout at this terminal's width, no popup
 #   termdash open-prs    open every PR in the git-notiql pane; what the ⧉ link in
 #                        that pane clicks through to, via ~/Applications/Open PRs.app
+#   termdash open-prs left|right   just one column of that pane, via
+#                        ~/Applications/Open PRs (left|right).app
 #
 # INSTALL:
 #   Leave this file inside the term-dash folder. Alias it, e.g. in ~/.zshrc:
@@ -213,14 +217,21 @@ brief_popup() {
 # `open` with several urls at a time rather than one call per url: macOS focuses
 # the browser on each call, so a loop of them steals focus repeatedly and lands
 # the tabs out of order. One call opens them as a batch, in order.
+# Optional $1 = left|right: just that column of the two-column layout, from the
+# per-column ⧉ links ("Open PRs (left).app" / "(right).app").
 open_prs() {
-  local urls count
-  if [ ! -r "$NOTIQL_PRS" ]; then
+  local urls count list="$NOTIQL_PRS"
+  case "${1:-}" in
+    "") ;;
+    left|right) list="$BRIEF_CACHE/notiql-prs-$1.txt" ;;
+    *) note "open-prs: unknown column '$1' (want left or right)"; return 1 ;;
+  esac
+  if [ ! -r "$list" ]; then
     note "no PR list yet — is the git-notiql pane running?"
     return 1
   fi
   # -r drops the trailing blank line an empty pane leaves behind.
-  urls=$(grep -E '^https://' "$NOTIQL_PRS" || true)
+  urls=$(grep -E '^https://' "$list" || true)
   count=$(printf '%s' "$urls" | grep -c . || true)
   if [ "${count:-0}" -eq 0 ]; then
     note "git-notiql pane is empty — nothing to open"
@@ -243,10 +254,27 @@ note() {
   fi
 }
 
-# prefix + b — show what is CACHED. Always instant, never fetches. --cached still
+# prefix + b — bring today's brief forward as the Chrome page (brief-open:
+# find-or-focus the tab, reload it, centre the window, activate Chrome). Builds
+# it first only if today's page doesn't exist yet.
+BRIEF_OPEN="$DASHBOARD_DIR/brief-open"
+brief() {
+  "$BRIEF_OPEN" >/dev/null 2>&1 || note "brief-open failed — run $BRIEF_OPEN by hand to see why"
+}
+
+# prefix + B — rebuild everything from scratch, then bring the page forward.
+# ~13s, so say so: run-shell -b gives no other sign that anything is happening.
+brief_fresh() {
+  note "rebuilding the morning brief…"
+  "$BRIEF_CMD" --fresh >/dev/null 2>&1 || { note "brief rebuild failed"; return 1; }
+  brief
+}
+
+# The old text brief in a tmux popup: what the attach/focus hooks below still
+# show until the popup is retired. Instant, never fetches. --cached still
 # generates on the spot in the one case where there is nothing to show at all
 # (you woke the machine after 6am, or launchd never fired).
-brief() {
+brief_text() {
   if ! session_exists; then
     # Outside tmux there is nothing to float over — just print it.
     "$BRIEF_CMD" --cached
@@ -256,9 +284,8 @@ brief() {
   touch "$(brief_seen_marker)"
 }
 
-# prefix + B — rebuild everything, then show it. Costs ~13s plus a re-summarise of
-# every Sentry row on screen.
-brief_fresh() {
+# The popup's rebuild-then-show, kept with brief_text.
+brief_text_fresh() {
   if ! session_exists; then
     "$BRIEF_CMD" --fresh
     return
@@ -275,7 +302,7 @@ brief_fresh() {
 brief_if_unseen() {
   mkdir -p "$BRIEF_CACHE"
   [ -e "$(brief_seen_marker)" ] && return 0
-  brief
+  brief_text
 }
 
 # Bound on the SESSION so it dies with the dashboard rather than leaking a hook
@@ -462,11 +489,12 @@ case "$cmd" in
   status) status ;;
   brief) brief ;;
   brief-fresh) brief_fresh ;;
-  open-prs) open_prs ;;
+  brief-popup) brief_text ;;
+  open-prs) open_prs "${2:-}" ;;
   brief-if-unseen) brief_if_unseen ;;
   brief-now) "$BRIEF_CMD" ;;
   *)
-    echo "Usage: termdash {up|down|restart|status|brief|brief-fresh|brief-now|open-prs}"
+    echo "Usage: termdash {up|down|restart|status|brief|brief-fresh|brief-popup|brief-now|open-prs}"
     exit 1
     ;;
 esac

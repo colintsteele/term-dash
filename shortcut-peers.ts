@@ -198,6 +198,10 @@ const PEERS_MAX_ROWS = 14; // the rest of the column belongs to worktrees
 
 const CACHE_DIR = path.join(os.homedir(), ".cache", "termdash");
 const SUMMARY_CACHE = path.join(CACHE_DIR, "shortcut-summaries.json");
+// Which link targets are finished. "Completed" is terminal, so a true here is
+// good forever and the story is never fetched again; anything else is re-checked
+// each poll because it can still move.
+const LINK_DONE_CACHE = path.join(CACHE_DIR, "shortcut-link-done.json");
 const SUMMARY_MAX = 24; // characters — 2-3 words, and the width budget below
 const SUMMARY_TIMEOUT_MS = 120_000;
 const SUMMARIES_ENABLED = process.env.TERMDASH_NO_LLM !== "1";
@@ -210,6 +214,10 @@ const BOLD = "\x1b[1m";
 const CYAN = "\x1b[36m";
 const GRAY = "\x1b[90m";
 const YELLOW = "\x1b[33m";
+// Plain ansi red rather than a 256-colour like SC_BLUE, so it resolves to
+// color1 -- #ea6962 in kitty.conf -- and tracks the terminal palette instead of
+// pinning a second, slightly-different red next to it.
+const RED = "\x1b[31m";
 
 
 function link(text: string, url: string): string {
@@ -222,6 +230,13 @@ function trunc(s: string, n: number): string {
 
 // ---- shortcut api ----
 
+/** Shortcut's verbs are "blocks", "duplicates" and "relates to". */
+interface ScStoryLink {
+  verb: string;
+  subject_id: number;
+  object_id: number;
+}
+
 interface ScStory {
   id: number;
   name: string;
@@ -229,6 +244,10 @@ interface ScStory {
   owner_ids: string[];
   updated_at: string;
   workflow_state_id: number;
+  // Already in every /stories/search response -- this interface just never
+  // named them. No extra request buys these.
+  story_links?: ScStoryLink[];
+  completed?: boolean;
 }
 interface ScMember {
   id: string;
@@ -285,6 +304,80 @@ async function fetchActiveStories(groupId: string, stateIds: number[]): Promise<
   const byId = new Map<number, ScStory>();
   for (const s of perState.flat()) if (!s.archived) byId.set(s.id, s);
   return [...byId.values()];
+}
+
+// ---- collisions: live work linked to work that is not finished ----
+//
+// RED here does NOT mean "blocked". Shortcut's `blocked` flag is 0 of 45 on this
+// board -- the team does not use it -- so a red built on it would never render.
+// It also would not be worth rendering: a blocked ticket is its owner's problem
+// and you cannot act on it from this pane.
+//
+// What IS worth a colour is two efforts that need reconciling, because that is
+// the question this pane exists to answer (see the header: "deciding whether the
+// thing you are about to pick up is already someone's"). That shows up as a
+// story_link whose other end has not shipped yet.
+//
+// The counterpart's state is the whole filter. Measured on this board: 15 linked
+// pairs, 9 of them pointing at Completed tickets -- history, and lighting those
+// would put ~20% of rows in red and bankrupt the colour. Excluding them leaves 3.
+async function resolveCollisions(
+  shown: ScStory[],
+  active: Map<number, ScStory>,
+): Promise<Map<number, number>> {
+  const out = new Map<number, number>();
+  if (!shown.length) return out;
+
+  let done: Record<string, true> = {};
+  try {
+    done = JSON.parse(fs.readFileSync(LINK_DONE_CACHE, "utf8")) as Record<string, true>;
+  } catch {
+    done = {};
+  }
+  const before = Object.keys(done).length;
+
+  for (const st of shown) {
+    // Lowest id wins when a story has several qualifying links, so the row shows
+    // the same counterpart on every poll rather than flickering between them.
+    const targets = (st.story_links ?? [])
+      .map((l) => (l.subject_id === st.id ? l.object_id : l.subject_id))
+      .filter((id) => id !== st.id)
+      .sort((a, b) => a - b);
+
+    for (const id of targets) {
+      if (done[String(id)]) continue;
+      // Already on the board in a started state, so it cannot be finished and
+      // costs no request to judge.
+      if (active.has(id)) {
+        out.set(st.id, id);
+        break;
+      }
+      let target: ScStory | null = null;
+      try {
+        target = await shortcut<ScStory>(`/stories/${id}`);
+      } catch {
+        // Deleted, or in a workspace this token cannot read. Stay quiet rather
+        // than lighting a row red over a story nobody can open.
+        continue;
+      }
+      if (target?.completed) {
+        done[String(id)] = true;
+        continue;
+      }
+      out.set(st.id, id);
+      break;
+    }
+  }
+
+  if (Object.keys(done).length !== before) {
+    try {
+      fs.mkdirSync(CACHE_DIR, { recursive: true });
+      fs.writeFileSync(LINK_DONE_CACHE, JSON.stringify(done, null, 2));
+    } catch {
+      // A cache that will not persist is slower, not broken.
+    }
+  }
+  return out;
 }
 
 // ---- one-time 2-3 word summaries, cached on disk ----
@@ -420,6 +513,7 @@ function render(
   summaries: Map<number, string>,
   myState: Map<number, PrInfo>,
   reviewStates: Set<number>,
+  collisions: Map<number, number>,
   note?: string,
 ): void {
   const width = process.stdout.columns || 55;
@@ -453,13 +547,28 @@ function render(
         // Colourised here rather than in the template so an empty slot emits a
         // plain space instead of a coloured one.
         const gh = reviewable && pr?.url ? `${SC_BLUE}${link("⎇", pr.url)}${RESET}` : " ";
-        // Width budget: " ⎿ " + id + space + 1-col ⎇ slot + space + 3-col marker.
-        const room = Math.max(6, width - 3 - id.length - 1 - 1 - 1 - 3);
+
+        // The counterpart is the payload, not a decoration: a red row whose
+        // partner you cannot name tells you something is wrong without telling
+        // you what. It is almost always off-screen too -- the live targets sit
+        // in Ready for Development and this pane only draws started work -- so
+        // there is no second red row to pair with by eye.
+        const hit = collisions.get(st.id);
+        const tailText = hit ? ` ↔${hit}` : "";
+
+        // Width budget: " ⎿ " + id + space + 1-col ⎇ slot + space + 3-col marker,
+        // less the counterpart when there is one. Only colliding rows pay for it.
+        const room = Math.max(6, width - 3 - id.length - 1 - 1 - 1 - 3 - tailText.length);
         const text = trunc(summaries.get(st.id) ?? st.name.toLowerCase(), Math.min(SUMMARY_MAX, room));
-        // Grey unless it is yours to review. See SC_STATES.
-        const idColor = reviewable ? SC_BLUE : GRAY;
+
+        // Red outranks blue. A row can be both yours to review and colliding,
+        // and the collision is the one that needs a decision -- "reviewable" is
+        // still carried by the blue ⎇ in the slot before it, so nothing is lost
+        // by spending the id on the louder fact.
+        const idColor = hit ? RED : reviewable ? SC_BLUE : GRAY;
+        const tail = hit ? `${RED}${tailText}${RESET}` : "";
         lines.push(
-          ` ${GRAY}⎿${RESET} ${link(`${idColor}${id}${RESET}`, storyUrl(st.id))} ${gh} ${mark}${text}`,
+          ` ${GRAY}⎿${RESET} ${link(`${idColor}${id}${RESET}`, storyUrl(st.id))} ${gh} ${mark}${text}${tail}`,
         );
       }
     }
@@ -600,6 +709,7 @@ async function gather(): Promise<{
   summaries: Map<number, string>;
   myState: Map<number, PrInfo>;
   reviewStates: Set<number>;
+  collisions: Map<number, number>;
   note?: string;
 }> {
   if (!SHORTCUT_TOKEN)
@@ -608,6 +718,7 @@ async function gather(): Promise<{
       summaries: new Map(),
       myState: new Map(),
       reviewStates: new Set(),
+      collisions: new Map(),
       note: "SHORTCUT_RO_TOKEN not set",
     };
 
@@ -624,6 +735,7 @@ async function gather(): Promise<{
       summaries: new Map(),
       myState: new Map(),
       reviewStates: new Set(),
+      collisions: new Map(),
       note: "no PEERS matched a Shortcut member",
     };
 
@@ -672,8 +784,13 @@ async function gather(): Promise<{
   // overflow behind a "+N" costs nothing until it surfaces.
   fitToBudget(blocks);
   const shown = blocks.flatMap((b) => b.stories.slice(0, b.visible));
-  const summaries = await ensureSummaries(shown);
-  return { blocks, summaries, myState, reviewStates };
+  // Same slice as the summaries, and for the same reason: a collision behind a
+  // "+N" is not on screen to be reconciled, so it costs nothing until it is.
+  const [summaries, collisions] = await Promise.all([
+    ensureSummaries(shown),
+    resolveCollisions(shown, new Map(stories.map((st) => [st.id, st]))),
+  ]);
+  return { blocks, summaries, myState, reviewStates, collisions };
 }
 
 // ---- --classify: re-derive PEERS (see the header) ----
@@ -759,7 +876,7 @@ async function tick(): Promise<void> {
     // resize that lands after the paint would leave the frame justified to the
     // old geometry until the next poll.
     selfSize(last.note ? PEERS_MIN_ROWS : desiredRows(last.blocks));
-    render(last.blocks, last.summaries, last.myState, last.reviewStates, last.note);
+    render(last.blocks, last.summaries, last.myState, last.reviewStates, last.collisions, last.note);
   } catch (err) {
     last = null;
     process.stdout.write("\x1b[3J\x1b[2J\x1b[H");
@@ -773,7 +890,7 @@ async function main(): Promise<void> {
   if (process.argv.includes("--once")) return;
   setInterval(tick, POLL_MINUTES * 60_000);
   process.stdout.on("resize", () => {
-    if (last) render(last.blocks, last.summaries, last.myState, last.reviewStates, last.note);
+    if (last) render(last.blocks, last.summaries, last.myState, last.reviewStates, last.collisions, last.note);
   });
 }
 

@@ -252,6 +252,7 @@ interface Worktree {
   agentState: AgentState; // rolled-up agent badge
   ci: Ci;
   prUrl?: string; // GitHub PR for this branch (undefined = repo has no GitHub slug)
+  hasPr?: boolean; // gh resolved a real PR for this branch (prUrl alone may be the search fallback)
   pushed: boolean; // `origin/<branch>` exists locally → the branch is on the remote, so a PR is possible
   approvals: number; // # of APPROVED reviews on that PR (0 if none / no PR / not resolved yet)
   merged: boolean; // the branch's most recent PR is MERGED → worktree is `worktree clean`-able
@@ -1007,6 +1008,7 @@ function gather(): Worktree[] {
         prUrl: repo.slug
           ? prCache.get(ciKey(repo.slug, branch)) ?? prSearchUrl(repo.slug, branch)
           : undefined,
+        hasPr: repo.slug ? prCache.has(ciKey(repo.slug, branch)) : false,
         pushed: pushed ? pushed.has(branch) : true, // null (unknown) → don't desaturate
         scTier: (() => { const id = shortcutId(branch); return id ? scTierCache.get(id) : undefined; })(),
         approvals: repo.slug ? approvalsCache.get(ciKey(repo.slug, branch)) ?? 0 : 0,
@@ -1037,20 +1039,38 @@ function gather(): Worktree[] {
   // agent activity happens to put it (popmenu's main checkout has hundreds of
   // sessions, so mtime ordering would shuffle it around), and it should never be
   // truncated away when you have a lot of worktrees open.
-  // Below it, linked worktrees split into two sections — ticketed work (branch
-  // carries an sc-<id>) then spikes/projects (everything else) — each keeping the
+  // Below it, linked worktrees split into two sections — ticketed work (see
+  // isTicket) then untracked work that has a PR anyway — each keeping the
   // old ordering internally: newest agent activity first, worktrees with no agents
   // sinking to the bottom. The groups are returned CONTIGUOUSLY because render()
   // draws its section rules by watching for the group to change as it walks the
   // list; interleaving them here would emit a rule between every row.
+  // Linked worktrees only make the panel when they're real work: see isTrackedWork.
   const main = worktrees.filter((w) => w.isMain);
-  const linked = worktrees.filter((w) => !w.isMain);
+  const linked = worktrees.filter((w) => !w.isMain && isTrackedWork(w));
   linked.sort((a, b) => b.mtime - a.mtime);
 
-  const ticketed = linked.filter((w) => shortcutId(w.branch));
-  const projects = linked.filter((w) => !shortcutId(w.branch));
+  const ticketed = linked.filter(isTicket);
+  const projects = linked.filter((w) => !isTicket(w));
   const [nTicket, nProject] = splitBudget(ticketed.length, projects.length, MAX_ROWS);
   return [...main, ...ticketed.slice(0, nTicket), ...projects.slice(0, nProject)];
+}
+
+// A linked worktree earns a row only if it's tied to a ticket or a PR. Prototypes
+// and scratch worktrees (help-me-write-prototype, ruby-llm-gem-test, …) pile up and
+// crowded out the work that actually has a reviewer or a story waiting on it.
+// Three ways in:
+//   - the directory is T-prefixed — the naming convention for ticket worktrees,
+//     which holds even before the branch is renamed to carry its sc- id
+//   - the branch carries an sc-<id>
+//   - gh has resolved a PR for the branch. A PR-only worktree therefore appears
+//     one slow tick after startup, once refreshSlow has filled prCache.
+function isTrackedWork(w: Worktree): boolean {
+  return isTicket(w) || !!w.hasPr;
+}
+
+function isTicket(w: Worktree): boolean {
+  return path.basename(w.wtPath).startsWith("T-") || !!shortcutId(w.branch);
 }
 
 // MAX_ROWS is a pane-height budget, and it's now spent across two sections. A flat
@@ -1077,7 +1097,7 @@ type Section = "main" | "ticket" | "project";
 
 function sectionOf(w: Worktree): Section {
   if (w.isMain) return "main";
-  return shortcutId(w.branch) ? "ticket" : "project";
+  return isTicket(w) ? "ticket" : "project";
 }
 
 function ciDot(status: CiStatus): string {

@@ -40,3 +40,44 @@ swiftc -O nextmeeting.swift -o bin/nextmeeting \
 codesign --force --sign - bin/nextmeeting
 
 echo "built bin/nextmeeting"
+
+# bin/NextMeeting.app — the SAME binary in a bundle, for the 06:00 brief.
+#
+# macOS checks calendar permission against the "responsible" app. In a term-dash
+# pane that's the terminal, which already has access. Under launchd it's the
+# job's own program, /bin/zsh, which can't be granted calendar access, so every
+# 06:00 brief came out "calendar denied" while the status strip worked fine.
+# Launched with `open`, the bundle is its own responsible app: it gets ONE
+# permission of its own, granted once, that holds however it is started.
+# morning-brief.ts falls back to it whenever the bare binary is denied.
+#
+# LSUIElement keeps it out of the Dock. The bundle id differs from the bare
+# binary's so the two permissions don't collide.
+APP=bin/NextMeeting.app
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS"
+cp bin/nextmeeting "$APP/Contents/MacOS/nextmeeting"
+cat > "$APP/Contents/Info.plist" <<'APPPLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.colinsteele.termdash.nextmeeting-app</string>
+  <key>CFBundleName</key>
+  <string>NextMeeting</string>
+  <key>CFBundleExecutable</key>
+  <string>nextmeeting</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSCalendarsUsageDescription</key>
+  <string>term-dash's morning brief shows today's meetings.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>term-dash's morning brief shows today's meetings.</string>
+</dict>
+</plist>
+APPPLIST
+codesign --force --sign - "$APP"
+echo "built $APP"

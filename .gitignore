@@ -25,3 +25,8 @@ bin/nextmeeting
 # copies of files already tracked here.
 *.bak
 *.bak.*
+
+# Build outputs (build-*.sh write these): rebuild locally, never commit
+bin/NextMeeting.app/
+bin/nextmeeting
+bin/unlock-watch

@@ -142,7 +142,12 @@ if #available(macOS 14.0, *) {
 // A prompt the user never answers must not wedge the caller. local-status polls
 // on a 5s tick and treats a missing/!ok exit as "nothing to show", so bailing
 // out loudly here is better than hanging.
-if sem.wait(timeout: .now() + 10) == .timedOut {
+//
+// Inside NextMeeting.app (the bundle the morning brief launches with `open`)
+// the first run is someone answering the permission dialog, so give them two
+// minutes instead of ten seconds. Nothing polls the bundle.
+let promptWait: Double = Bundle.main.bundlePath.hasSuffix(".app") ? 120 : 10
+if sem.wait(timeout: .now() + promptWait) == .timedOut {
     fail(access: "unknown", "timed out waiting for calendar permission")
 }
 if let e = requestError {
@@ -151,7 +156,9 @@ if let e = requestError {
 if !granted {
     let status = EKEventStore.authorizationStatus(for: .event)
     fail(access: status == .restricted ? "restricted" : "denied",
-         "calendar access not granted to the terminal app")
+         Bundle.main.bundlePath.hasSuffix(".app")
+           ? "calendar access not granted to NextMeeting.app"
+           : "calendar access not granted to the terminal app")
 }
 
 // `--calendars` exists to answer the one question that breaks this setup: did
