@@ -8,6 +8,10 @@
  *   - wheel / arrows   → scroll
  *   - type + Enter     → append a new to-do under the same heading
  *
+ * Also runs headless, which is how the morning brief's "To-do it" buttons add
+ * items — one append path, so the week-rollover rule has one implementation:
+ *   notion-todo.ts --add "text"
+ *
  * Requires: NOTION_TOKEN + NOTION_PAGE_ID env vars, npx tsx
  *   NOTION_PAGE_ID is the target page's 32-char id (with or without dashes),
  *   e.g. the trailing segment of its notion.so URL.
@@ -16,6 +20,8 @@
  * forwards events to a pane once the program in it asks for them, which is what
  * the DECSET 1000/1006 sequences below do.
  */
+
+import { mondayOf, needsNewWeek, weekLabel } from "./notion-week";
 
 const TOKEN = process.env.NOTION_TOKEN;
 const PAGE_ID = process.env.NOTION_PAGE_ID;
@@ -131,6 +137,47 @@ async function findCurrentWeek(): Promise<Block> {
   const headings = blocks.filter(isWeekHeading);
   if (headings.length === 0) throw new Error("No M/D week heading found on the page.");
   return headings[headings.length - 1];
+}
+
+/**
+ * The heading a to-do added NOW belongs under, creating this week's if the
+ * page has not got one yet.
+ *
+ * Before this, every append landed under whatever the last heading happened
+ * to be — so an item added three weeks later joined the old week's list. See
+ * notion-week.ts for why "same week" is Monday-to-Sunday and why a new
+ * heading is always the Monday, even though the page's own history is a mix
+ * of Mondays, Sundays and one Friday.
+ *
+ * Appended at the END of the page, which is where `findCurrentWeek` looks.
+ * Created toggleable and as a heading_1 to match what is already there, so
+ * it collapses like the rest.
+ *
+ * READ-ONLY CALLERS MUST NOT USE THIS. The pane polls every 45s; having that
+ * create a heading would litter the page with empty weeks nobody asked for.
+ * It is called from the append path only.
+ */
+async function ensureCurrentWeek(now = new Date()): Promise<Block> {
+  const blocks = await fetchChildren(PAGE_ID!);
+  const headings = blocks.filter(isWeekHeading);
+  const last = headings[headings.length - 1] ?? null;
+  if (!needsNewWeek(last ? blockText(last) : null, now)) return last!;
+
+  const label = weekLabel(mondayOf(now));
+  const created = await notion("PATCH", `/blocks/${PAGE_ID}/children`, {
+    children: [
+      {
+        type: "heading_1",
+        heading_1: {
+          rich_text: [{ type: "text", text: { content: label } }],
+          is_toggleable: true,
+        },
+      },
+    ],
+  });
+  const block = (created as { results?: Block[] }).results?.[0];
+  if (!block) throw new Error(`Notion did not return the new ${label} heading.`);
+  return block;
 }
 
 async function fetchTodos(headingId: string): Promise<Todo[]> {
@@ -291,12 +338,24 @@ async function submit(): Promise<void> {
   render();
 
   try {
+    // Roll the week over FIRST, so an item added after a gap starts this
+    // week's list instead of joining the last one. `heading` is the pane's
+    // cached read-only target; re-pointing it here means the list below
+    // redraws as the new (empty) week, which is the honest view.
+    const target = await ensureCurrentWeek();
+    if (target.id !== heading.id) {
+      heading = target;
+      todos = [];
+    }
     await appendTodo(heading.id, text);
     todos = await fetchTodos(heading.id);
     scroll = Number.MAX_SAFE_INTEGER;
     setStatus(`${GREEN}✓${RESET} added`, DIM, 2000);
   } catch (err) {
-    todos.pop();
+    // Drop the optimistic row by IDENTITY, not by popping: a week rollover
+    // above may have replaced the whole array, and popping would then remove
+    // a real to-do instead of the pending one.
+    todos = todos.filter((t) => !t.id.startsWith("pending-"));
     setStatus(`✗ ${(err as Error).message}`, RED, 6000);
   }
 }
@@ -416,6 +475,38 @@ function handleKeys(data: string): void {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main(): Promise<void> {
+  // ── headless append ───────────────────────────────────────────────────────
+  //   notion-todo.ts --add "text"
+  //
+  // The same append the pane does, without the pane: no TTY, no alternate
+  // screen, no polling. This exists so the brief's "To-do it" button and the
+  // interactive list cannot drift — both go through ensureCurrentWeek() and
+  // appendTodo() here, so the week-rollover rule has exactly one
+  // implementation. A second script that posted to Notion itself would be a
+  // second place to forget about new weeks.
+  //
+  // Checked BEFORE the TTY guard: the button's URL-handler app has no
+  // terminal at all, and the guard below would reject it.
+  const addAt = process.argv.indexOf("--add");
+  if (addAt !== -1) {
+    const text = process.argv.slice(addAt + 1).join(" ").trim();
+    if (!text) {
+      console.error('notion-todo --add needs some text: --add "review PR 123"');
+      process.exit(1);
+    }
+    try {
+      const target = await ensureCurrentWeek();
+      await appendTodo(target.id, text);
+      // One line on stdout, because the caller is a URL handler with nowhere
+      // to show anything — this is for `log show` and for running it by hand.
+      console.log(`added under ${blockText(target)}: ${text}`);
+      process.exit(0);
+    } catch (err) {
+      console.error(`notion-todo --add failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  }
+
   if (!process.stdin.isTTY) {
     console.error("notion-todo needs a TTY (run it in a tmux pane).");
     process.exit(1);

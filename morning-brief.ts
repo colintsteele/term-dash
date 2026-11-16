@@ -55,6 +55,10 @@
  *   --cached   print today's cached copy verbatim; generates only if none exists
  *   --fresh    ignore every cache, regenerate summaries and all, then cache it
  *   --json     the raw section data, for debugging a row that looks wrong
+ *   --html     same as --write, then print the Chrome page's path
+ *
+ *   --write / --fresh / --cached also write the Chrome page (brief-html.ts) to
+ *   ~/.cache/termdash/brief/today.html — see brief-open for how it gets shown.
  *   GITHUB_TOKEN        enriches it with PR detail  (absent → section skipped)
  *   SENTRY_AUTH_TOKEN   drives the SENTRY section   (absent → section skipped)
  *   A missing token degrades ONE section and says so in place. It never takes
@@ -66,6 +70,8 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { renderHtml, type BriefModel } from "./brief-html";
+import { effortOf, rateEfforts, EFFORT_RANK, type Effort } from "./pr-effort";
 
 // ---------------------------------------------------------------------------
 // CONFIG
@@ -436,6 +442,37 @@ interface ReviewRow {
   approvedByOthers: boolean;
   requestedOfMe: boolean; // I am currently a requested reviewer
   reReview: boolean; // I reviewed once already and it has come back to me
+  interacted: boolean; // I have reviewed or commented on it at some point
+  effort: Effort | null; // pr-effort.ts rating, shared with git-notiql
+  repo: string;
+  createdAt: string;
+  reviewCount: number; // submitted reviews, everyone
+  commentCount: number; // conversation comments + review-thread comments, everyone
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  app: { additions: number; deletions: number; files: number; partial: boolean }; // see isAppCode
+}
+
+// "App code" is everything a reviewer has to reason about as production
+// behaviour. Tests, fixtures, stories, docs, lockfiles and generated schema
+// dumps are left out: they can double a diff's line count without adding
+// much review work. Path-based and deliberately conservative: when unsure, a
+// file counts as app code.
+const NON_APP_CODE = [
+  /(^|\/)(spec|test|tests|__tests__|__mocks__|__snapshots__|cypress|e2e|fixtures|factories)\//,
+  /\.(test|spec|stories|story)\.[jt]sx?$/,
+  /_spec\.rb$/,
+  /\.snap$/,
+  /(^|\/)docs?\//,
+  /\.mdx?$/,
+  /(^|\/)(yarn\.lock|package-lock\.json|pnpm-lock\.yaml|Gemfile\.lock)$/,
+  /(^|\/)db\/(schema\.rb|structure\.sql)$/,
+  /(^|\/)\.github\//,
+  /(^|\/)schema\.graphql$|\.generated\.|(^|\/)__generated__\//,
+];
+function isAppCode(file: string): boolean {
+  return !NON_APP_CODE.some((re) => re.test(file));
 }
 
 async function shortcut<T>(p: string, body?: unknown): Promise<T> {
@@ -451,7 +488,22 @@ async function shortcut<T>(p: string, body?: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// GitHub's GraphQL API now and then fails a perfectly good query with a 502 or
+// "Something went wrong while executing your query", and a second try a moment
+// later succeeds. One of those at 06:00 would blank a section for the whole
+// day, so transient failures get exactly one retry.
 async function graphql<T>(query: string): Promise<T> {
+  try {
+    return await graphqlOnce<T>(query);
+  } catch (e) {
+    const m = (e as Error).message;
+    if (!/-> 5\d\d|Something went wrong|timedout|timeout/i.test(m)) throw e;
+    await new Promise((r) => setTimeout(r, 3000));
+    return graphqlOnce<T>(query);
+  }
+}
+
+async function graphqlOnce<T>(query: string): Promise<T> {
   const res = await fetch(GRAPHQL_URL, {
     method: "POST",
     headers: {
@@ -530,8 +582,13 @@ async function fetchReviews(): Promise<{ rows: ReviewRow[]; note?: string }> {
   // (which would cost far more). The gap is a bare top-level comment, which is
   // why `comments` is fetched too.
   const frag = `
-    number title url createdAt
+    number title url createdAt additions deletions changedFiles
+    files(first: 100) { nodes { path additions deletions } }
+    repository { nameWithOwner }
     author { login }
+    allReviews: reviews { totalCount }
+    allComments: comments { totalCount }
+    reviewThreads(first: 100) { nodes { comments { totalCount } } }
     reviewDecision
     timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1) {
       nodes { ... on ReadyForReviewEvent { createdAt } }
@@ -560,6 +617,14 @@ async function fetchReviews(): Promise<{ rows: ReviewRow[]; note?: string }> {
     reviews: { nodes: { state: string; submittedAt: string | null }[] };
     comments: { nodes: { author: { login: string } | null }[] };
     reviewRequests: { nodes: { requestedReviewer: { login?: string } | null }[] };
+    additions: number;
+    deletions: number;
+    changedFiles: number;
+    files: { nodes: { path: string; additions: number; deletions: number }[] } | null;
+    repository: { nameWithOwner: string };
+    allReviews: { totalCount: number };
+    allComments: { totalCount: number };
+    reviewThreads: { nodes: { comments: { totalCount: number } }[] };
   };
 
   const data = await graphql<Record<string, { pullRequest: GqlPr | null }>>(query);
@@ -596,8 +661,8 @@ async function fetchReviews(): Promise<{ rows: ReviewRow[]; note?: string }> {
     // are what used to pad this section out.
     if (!neverReviewed && !requestedOfMe) return;
 
-    const touchedByMe =
-      neverReviewed && pr.comments.nodes.some((n) => n.author?.login === MY_LOGIN);
+    const commented = pr.comments.nodes.some((n) => n.author?.login === MY_LOGIN);
+    const touchedByMe = neverReviewed && commented;
 
     // No window test. A PR I still owe a review on does not stop needing one
     // because it went up on Monday — see the note on the REVIEWS header.
@@ -615,10 +680,45 @@ async function fetchReviews(): Promise<{ rows: ReviewRow[]; note?: string }> {
       approvedByOthers: pr.reviewDecision === "APPROVED",
       requestedOfMe,
       reReview: !neverReviewed,
+      interacted: !neverReviewed || commented,
+      effort: null, // filled in below, once every row is known
+      repo: pr.repository.nameWithOwner,
+      createdAt: pr.createdAt,
+      reviewCount: pr.allReviews.totalCount,
+      commentCount:
+        pr.allComments.totalCount + pr.reviewThreads.nodes.reduce((n, t) => n + t.comments.totalCount, 0),
+      additions: pr.additions,
+      deletions: pr.deletions,
+      changedFiles: pr.changedFiles,
+      app: (() => {
+        const files = pr.files?.nodes ?? [];
+        const app = files.filter((f) => isAppCode(f.path));
+        return {
+          additions: app.reduce((n, f) => n + f.additions, 0),
+          deletions: app.reduce((n, f) => n + f.deletions, 0),
+          files: app.length,
+          // Only the first 100 files are listed, so a huge PR's app count is a
+          // floor, not the real figure.
+          partial: pr.changedFiles > files.length,
+        };
+      })(),
     });
   });
 
-  rows.sort((a, b) => (a.readyAt < b.readyAt ? -1 : 1));
+  // Review effort comes from the same cache git-notiql's team section reads
+  // and fills (pr-effort.ts, ~/.local/state/termdash/pr-effort.json). A PR that
+  // went up overnight was never on screen for git-notiql to rate, so rate the
+  // gaps here. Same function, same cache, so git-notiql won't re-rate them.
+  // Failure is fine: the row just shows as unrated.
+  await rateEfforts(
+    rows.map((r) => ({ repo: r.repo, prNumber: r.number })),
+    (q) => graphql(q),
+  ).catch(() => false);
+  for (const r of rows) r.effort = effortOf(r.repo, r.number) ?? null;
+
+  // Quick reviews first, as in git-notiql; oldest first within an effort level.
+  const rank = (r: ReviewRow) => (r.effort ? EFFORT_RANK[r.effort] : 3);
+  rows.sort((a, b) => rank(a) - rank(b) || (a.readyAt < b.readyAt ? -1 : 1));
 
   return { rows };
 }
@@ -648,22 +748,40 @@ interface AgendaReport {
 
 const NEXTMEETING_BIN = path.join(__dirname, "bin", "nextmeeting");
 
+const NEXTMEETING_APP = path.join(__dirname, "bin", "NextMeeting.app");
+
+// The bare binary first: from a terminal it rides on the terminal's calendar
+// permission. Under launchd (the 06:00 run) that permission doesn't apply and
+// it reports "denied", so fall back to NextMeeting.app launched via `open`,
+// which holds a calendar permission of its own. See build-nextmeeting.sh.
+function runAgenda(): AgendaReport {
+  const parse = (raw: string) => JSON.parse(raw) as AgendaReport;
+  const direct = parse(execFileSync(NEXTMEETING_BIN, ["--agenda"], { encoding: "utf8", timeout: 15_000 }));
+  if (direct.access === "granted" || !fs.existsSync(NEXTMEETING_APP)) return direct;
+
+  // `open` hands the app to LaunchServices, so its stdout isn't ours: --stdout
+  // sends it to a file. -W waits for exit, -n forces a fresh instance, -g keeps
+  // it from taking focus.
+  const out = path.join(os.tmpdir(), `nextmeeting-${process.pid}.json`);
+  try {
+    execFileSync("/usr/bin/open", ["-W", "-n", "-g", "--stdout", out, "--stderr", "/dev/null", NEXTMEETING_APP, "--args", "--agenda"], {
+      timeout: 150_000,
+    });
+    return parse(fs.readFileSync(out, "utf8"));
+  } catch {
+    return direct;
+  } finally {
+    fs.rmSync(out, { force: true });
+  }
+}
+
 function fetchAgenda(): { events: Meeting[]; note?: string } {
   if (!fs.existsSync(NEXTMEETING_BIN)) return { events: [], note: "bin/nextmeeting not built — run ./build-nextmeeting.sh" };
-  let raw: string;
-  try {
-    // execFileSync, not a shell: the binary is a one-shot that always exits, and
-    // its EventKit permission prompt is already resolved because the status
-    // strip has been calling it every 5s all week.
-    raw = execFileSync(NEXTMEETING_BIN, ["--agenda"], { encoding: "utf8", timeout: 15_000 });
-  } catch (e) {
-    return { events: [], note: `nextmeeting: ${(e as Error).message}` };
-  }
   let report: AgendaReport;
   try {
-    report = JSON.parse(raw);
-  } catch {
-    return { events: [], note: "nextmeeting: unparseable output" };
+    report = runAgenda();
+  } catch (e) {
+    return { events: [], note: `nextmeeting: ${(e as Error).message.split("\n")[0]}` };
   }
   if (report.access !== "granted") return { events: [], note: `calendar ${report.access}${report.error ? ` — ${report.error}` : ""}` };
   if (report.error) return { events: [], note: report.error };
@@ -893,6 +1011,392 @@ async function fetchSentry(now: Date): Promise<{ rows: OwnedRow[]; note?: string
 }
 
 // ---------------------------------------------------------------------------
+// MY PRs — your own open PRs, classified by whose move it is
+// ---------------------------------------------------------------------------
+//
+// git-notiql already badges conversation on these all day. What it does not
+// say in one place is the STATE each one is in — red CI, changes requested,
+// approved and sitting there unmerged — which is the "what do I do first" list
+// for the morning. One GitHub search, plus one Shortcut read per linked story.
+//
+// "Approved and green" is NOT "merge it". Popmenu PRs go through QA unless the
+// Shortcut story carries the NO QA Required label, and that gate lives in
+// Shortcut, not GitHub. An approved PR whose story is in Ready for QA / In QA
+// (usually with a "Has QA App" label on the PR) is waiting on QA, not on you.
+// One that is approved, needs QA, and whose story hasn't reached QA yet IS on
+// you: move the ticket.
+
+export type MyPrState = "ci-failing" | "changes" | "conflict" | "to-qa" | "ready" | "qa" | "waiting" | "draft";
+
+export interface MyPrRow {
+  number: number;
+  url: string;
+  title: string;
+  repo: string;
+  state: MyPrState;
+  ci: string | null; // SUCCESS / FAILURE / ERROR / PENDING / EXPECTED / null
+  approvals: number;
+  updatedAt: string;
+  storyId: number | null;
+  storyState: string | null; // the linked Shortcut story's workflow state
+  noQa: boolean; // story labelled NO QA Required
+  qaApp: boolean; // PR labelled "Has QA App"
+}
+
+// Delivery workflow states at or past QA. "Ready for Merge" and later mean QA is
+// done; the two QA states mean it is under way.
+const QA_STATES = ["Ready for QA", "In QA"];
+const POST_QA_STATES = ["Ready for Merge", "Ready for Deploy", "Ready for Approval", "Completed"];
+const NO_QA_LABEL = "no qa required"; // matched case-insensitively; the real label is "NO QA Required"
+const QA_APP_LABEL = "has qa app";
+
+async function fetchMyPrs(): Promise<{ rows: MyPrRow[]; note?: string }> {
+  if (!GITHUB_TOKEN) return { rows: [], note: "GITHUB_TOKEN not set" };
+
+  type Node = {
+    number: number;
+    title: string;
+    url: string;
+    isDraft: boolean;
+    updatedAt: string;
+    reviewDecision: string | null;
+    mergeable: string;
+    headRefName: string;
+    labels: { nodes: { name: string }[] };
+    repository: { nameWithOwner: string };
+    commits: { nodes: { commit: { statusCheckRollup: { state: string } | null } }[] };
+    latestOpinionatedReviews: { nodes: { state: string }[] };
+  };
+  const data = await graphql<{ search: { nodes: Node[] } }>(`query {
+    search(query: "is:pr is:open archived:false author:${MY_LOGIN}", type: ISSUE, first: 50) {
+      nodes { ... on PullRequest {
+        number title url isDraft updatedAt reviewDecision mergeable headRefName
+        labels(first: 20) { nodes { name } }
+        repository { nameWithOwner }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+        latestOpinionatedReviews(first: 20) { nodes { state } }
+      } }
+    }
+  }`);
+  const nodes = data.search.nodes.filter((n) => n.number); // search can return non-PR nodes as {}
+
+  // The story comes from the branch name (steele/sc-182370/…), which is how
+  // Shortcut links them in the first place. No token, or a branch with no sc-id:
+  // the story is unknown, and the PR is classified on GitHub alone.
+  const storyOf = (n: Node) => Number(n.headRefName.match(/sc-(\d+)/)?.[1]) || null;
+  const stories = new Map<number, { state: string; noQa: boolean }>();
+  if (SHORTCUT_TOKEN) {
+    const ids = [...new Set(nodes.map(storyOf).filter((x): x is number => x != null))];
+    const [states, details] = await Promise.all([
+      scStateNames(),
+      Promise.all(
+        ids.map((id) =>
+          shortcut<{ id: number; workflow_state_id: number; labels: { name: string }[] }>(`/stories/${id}`).catch(() => null),
+        ),
+      ),
+    ]);
+    for (const d of details) {
+      if (!d) continue;
+      stories.set(d.id, {
+        state: states.get(d.workflow_state_id) ?? "?",
+        noQa: d.labels.some((l) => l.name.trim().toLowerCase() === NO_QA_LABEL),
+      });
+    }
+  }
+
+  // First match wins, in order of "what blocks the merge hardest". Red CI
+  // outranks requested changes because it is yours to fix without waiting on
+  // anyone; a conflict outranks waiting because no amount of review will merge it.
+  const classify = (n: Node, ci: string | null, story: { state: string; noQa: boolean } | undefined, qaApp: boolean): MyPrState => {
+    if (n.isDraft) return "draft";
+    if (ci === "FAILURE" || ci === "ERROR") return "ci-failing";
+    if (n.reviewDecision === "CHANGES_REQUESTED") return "changes";
+    if (n.mergeable === "CONFLICTING") return "conflict";
+    if (n.reviewDecision === "APPROVED" && (ci === "SUCCESS" || ci === null)) {
+      if (!story || story.noQa || POST_QA_STATES.includes(story.state)) return "ready";
+      if (QA_STATES.includes(story.state) || qaApp) return "qa";
+      return "to-qa";
+    }
+    return "waiting";
+  };
+
+  const rows = nodes.map((n) => {
+    const ci = n.commits.nodes[0]?.commit.statusCheckRollup?.state ?? null;
+    const storyId = storyOf(n);
+    const story = storyId ? stories.get(storyId) : undefined;
+    const qaApp = n.labels.nodes.some((l) => l.name.trim().toLowerCase() === QA_APP_LABEL);
+    return {
+      number: n.number,
+      url: n.url,
+      title: n.title,
+      repo: n.repository.nameWithOwner,
+      state: classify(n, ci, story, qaApp),
+      ci,
+      approvals: n.latestOpinionatedReviews.nodes.filter((r) => r.state === "APPROVED").length,
+      updatedAt: n.updatedAt,
+      storyId,
+      storyState: story?.state ?? null,
+      noQa: story?.noQa ?? false,
+      qaApp,
+    };
+  });
+  const order: MyPrState[] = ["ci-failing", "changes", "conflict", "to-qa", "ready", "qa", "waiting", "draft"];
+  rows.sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state) || (a.updatedAt < b.updatedAt ? 1 : -1));
+  return { rows };
+}
+
+// Workflow state id → trimmed name, across every workflow. Fetched once per run
+// and shared by the PR and Shortcut sections.
+let scStatesP: Promise<Map<number, string>> | null = null;
+function scStateNames(): Promise<Map<number, string>> {
+  scStatesP ??= shortcut<{ states: { id: number; name: string }[] }[]>("/workflows").then(
+    (ws) => new Map(ws.flatMap((w) => w.states.map((s) => [s.id, s.name.trim()] as const))),
+  );
+  return scStatesP;
+}
+
+// ---------------------------------------------------------------------------
+// SHORTCUT — conversation aimed at you, your stories, new team stories
+// ---------------------------------------------------------------------------
+//
+// Three questions, three answers:
+//   TALK   comments since the window opened, by someone else, that either
+//          @-mention you or sit on a story you own.
+//   MINE   every story you own that is not done.
+//   FRESH  team stories created since the window opened that are not yours —
+//          the "look at this and decide something" pile (estimate, pick up, push
+//          back on).
+//
+// Shortcut has no notifications API and its search has no comment operator
+// (`comment:` and `mention:` are silently ignored — `mention:steele` returns the
+// same 640 stories as no filter at all). So TALK is computed: pull full detail
+// for team stories and your own stories updated inside the window, and read the
+// comments. The cost is that a mention on ANOTHER team's story you don't own is
+// invisible here. That is a known hole, not a bug.
+
+export interface ScTalk {
+  storyId: number;
+  storyName: string;
+  url: string;
+  author: string;
+  text: string;
+  createdAt: string;
+  mention: boolean; // false = a comment on a story you own, without naming you
+}
+
+export interface ScStoryRow {
+  id: number;
+  name: string;
+  url: string;
+  state: string;
+  stateType: string; // backlog / unstarted / started / done
+  blocked: boolean;
+  estimate: number | null;
+  updatedAt: string;
+  createdAt: string;
+  type: string;
+  owners: string[];
+}
+
+interface ScSearchStory {
+  id: number;
+  name: string;
+  app_url: string;
+  workflow_state_id: number;
+  blocked: boolean;
+  estimate: number | null;
+  updated_at: string;
+  created_at: string;
+  story_type: string;
+  owner_ids: string[];
+  archived: boolean;
+  comments?: {
+    author_id: string;
+    created_at: string;
+    text: string;
+    app_url?: string;
+    deleted?: boolean;
+    member_mention_ids?: string[];
+  }[];
+}
+
+// Search is paged 25 at a time with an opaque `next` path. Capped so a query
+// that unexpectedly matches the whole workspace costs eight requests, not eighty.
+async function scSearch(query: string, detail: "slim" | "full" = "slim"): Promise<ScSearchStory[]> {
+  const out: ScSearchStory[] = [];
+  const first = `/search/stories?${new URLSearchParams({ query, detail, page_size: "25" })}`;
+  let next: string | null = first;
+  for (let page = 0; next && page < 8; page++) {
+    const res: { data: ScSearchStory[]; next: string | null } = await shortcut(next.replace(/^\/api\/v3/, ""));
+    out.push(...res.data);
+    next = res.next;
+  }
+  return out;
+}
+
+function ymd(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+async function fetchShortcutBrief(
+  start: Date,
+): Promise<{ talk: ScTalk[]; mine: ScStoryRow[]; fresh: ScStoryRow[]; note?: string }> {
+  const empty = { talk: [], mine: [], fresh: [] };
+  if (!SHORTCUT_TOKEN) return { ...empty, note: "SHORTCUT_RO_TOKEN not set" };
+
+  const [me, workflows, members] = await Promise.all([
+    shortcut<{ id: string; mention_name: string }>("/member"),
+    shortcut<{ states: { id: number; name: string; type: string }[] }[]>("/workflows"),
+    shortcut<{ id: string; profile: { name: string } }[]>("/members"),
+  ]);
+  const states = new Map(workflows.flatMap((w) => w.states.map((s) => [s.id, s] as const)));
+  const nameOf = new Map(members.map((m) => [m.id, m.profile.name]));
+
+  // `updated:` and `created:` only take dates, so search from the window's DATE
+  // and filter to the window's exact instant afterwards.
+  const since = ymd(start);
+  const team = `team:"${SC_TEAM_NAME}"`;
+  const [mineAll, teamTouched, mineTouched, created] = await Promise.all([
+    scSearch(`owner:${me.mention_name} !is:done !is:archived`),
+    scSearch(`${team} updated:${since}..*`, "full"),
+    scSearch(`owner:${me.mention_name} updated:${since}..*`, "full"),
+    scSearch(`${team} created:${since}..* !is:archived`),
+  ]);
+
+  const row = (s: ScSearchStory): ScStoryRow => {
+    const st = states.get(s.workflow_state_id);
+    return {
+      id: s.id,
+      name: s.name,
+      url: s.app_url,
+      state: st?.name.trim() ?? "?",
+      stateType: st?.type ?? "?",
+      blocked: s.blocked,
+      estimate: s.estimate,
+      updatedAt: s.updated_at,
+      createdAt: s.created_at,
+      type: s.story_type,
+      owners: s.owner_ids.map((id) => nameOf.get(id) ?? "?"),
+    };
+  };
+
+  const startIso = start.toISOString();
+  const touched = new Map<number, ScSearchStory>();
+  for (const s of [...teamTouched, ...mineTouched]) touched.set(s.id, s);
+  const talk: ScTalk[] = [];
+  for (const s of touched.values()) {
+    const owned = s.owner_ids.includes(me.id);
+    for (const c of s.comments ?? []) {
+      if (c.deleted || c.author_id === me.id || c.created_at < startIso) continue;
+      const mention = (c.member_mention_ids ?? []).includes(me.id);
+      if (!mention && !owned) continue;
+      talk.push({
+        storyId: s.id,
+        storyName: s.name,
+        url: c.app_url ?? s.app_url,
+        author: nameOf.get(c.author_id) ?? "someone",
+        text: c.text,
+        createdAt: c.created_at,
+        mention,
+      });
+    }
+  }
+  talk.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+
+  // Started work first, then what's queued, then backlog; freshest first inside
+  // each. Blocked floats to the top of its group because it is the one row in
+  // here that is probably waiting on YOU to chase someone.
+  const typeRank: Record<string, number> = { started: 0, unstarted: 1, backlog: 2 };
+  const mine = mineAll
+    .map(row)
+    .sort(
+      (a, b) =>
+        (typeRank[a.stateType] ?? 3) - (typeRank[b.stateType] ?? 3) ||
+        Number(b.blocked) - Number(a.blocked) ||
+        (a.updatedAt < b.updatedAt ? 1 : -1),
+    );
+
+  const fresh = created
+    .filter((s) => s.created_at >= startIso && !s.owner_ids.includes(me.id))
+    .map(row)
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+
+  return { talk, mine, fresh };
+}
+
+// ---------------------------------------------------------------------------
+// NOTION — unfinished to-dos from the weekly list notion-todo.ts manages
+// ---------------------------------------------------------------------------
+//
+// The page is a run of toggleable M/D headings ("10/26"), each holding that
+// week's to_do blocks; see notion-week.ts for its quirks. The CURRENT week is
+// the LAST such heading in page order, the same rule notion-todo.ts uses (the
+// page is not sorted, so "latest date" would be wrong).
+//
+// Read-only and deliberately duplicated rather than imported: notion-todo.ts
+// starts its interactive pane at import time.
+
+export interface NotionTodoGroup {
+  heading: string;
+  items: { text: string; url: string }[];
+}
+
+const NOTION_TOKEN = process.env.NOTION_TOKEN;
+const NOTION_PAGE_ID = process.env.NOTION_PAGE_ID;
+
+async function fetchNotionTodos(): Promise<{ current: NotionTodoGroup | null; older: NotionTodoGroup[]; note?: string }> {
+  if (!NOTION_TOKEN || !NOTION_PAGE_ID) return { current: null, older: [], note: "NOTION_TOKEN / NOTION_PAGE_ID not set" };
+
+  type Block = { id: string; type: string; has_children?: boolean; to_do?: { checked: boolean } } & Record<string, unknown>;
+  const children = async (id: string): Promise<Block[]> => {
+    const out: Block[] = [];
+    let cursor: string | null = null;
+    do {
+      const res = await fetch(
+        `https://api.notion.com/v1/blocks/${id}/children?page_size=100${cursor ? `&start_cursor=${cursor}` : ""}`,
+        { headers: { Authorization: `Bearer ${NOTION_TOKEN}`, "Notion-Version": "2022-06-28" } },
+      );
+      if (!res.ok) throw new Error(`notion ${res.status}`);
+      const page = (await res.json()) as { results: Block[]; has_more: boolean; next_cursor: string | null };
+      out.push(...page.results);
+      cursor = page.has_more ? page.next_cursor : null;
+    } while (cursor);
+    return out;
+  };
+  const text = (b: Block) =>
+    ((b[b.type] as { rich_text?: { plain_text: string }[] } | undefined)?.rich_text ?? [])
+      .map((r) => r.plain_text)
+      .join("")
+      .trim();
+
+  const top = await children(NOTION_PAGE_ID);
+  const weeks = top.filter((b) => b.type.startsWith("heading") && /^\d{1,2}\s*\/\s*\d{1,2}/.test(text(b)));
+  const page = NOTION_PAGE_ID.replace(/-/g, "");
+
+  // Three at a time: Notion averages 3 requests/s per integration, and there are
+  // ~30 week headings.
+  const groups: NotionTodoGroup[] = new Array(weeks.length);
+  for (let i = 0; i < weeks.length; i += 3) {
+    await Promise.all(
+      weeks.slice(i, i + 3).map(async (h, j) => {
+        const kids = h.has_children ? await children(h.id) : [];
+        groups[i + j] = {
+          heading: text(h).replace(/\s+/g, ""),
+          items: kids
+            .filter((b) => b.type === "to_do" && !b.to_do?.checked && text(b))
+            .map((b) => ({ text: text(b), url: `https://www.notion.so/${page}#${b.id.replace(/-/g, "")}` })),
+        };
+      }),
+    );
+  }
+
+  const current = groups.at(-1) ?? null;
+  // Older weeks newest-first (page order reversed), empty ones dropped.
+  const older = groups.slice(0, -1).reverse().filter((g) => g.items.length);
+  return { current, older };
+}
+
+// ---------------------------------------------------------------------------
 // RENDER
 // ---------------------------------------------------------------------------
 
@@ -912,15 +1416,16 @@ function renderReviews(r: Awaited<ReturnType<typeof fetchReviews>>, now: Date): 
   // Deliberately NOT "since <window>". Every other section of the brief is a
   // delta; this one is a queue. A review you owe from Monday is still owed on
   // Friday, so age changes where the row sorts, never whether it appears.
-  const out = [rule(`REVIEWS  🤝 ${SC_TEAM_NAME} · awaiting your review`), ""];
+  // An empty queue does not deserve four lines. The rule has to be drawn
+  // whatever happens, so when there is nothing to list the state rides on the
+  // rule itself and the section costs exactly its own border. renderAgenda and
+  // renderSentry do the same -- between them the three empty sections used to
+  // spend twelve lines saying nothing was going on.
+  const head = `REVIEWS  🤝 ${SC_TEAM_NAME}`;
+  if (r.note) return [rule(`${head} · skipped — ${r.note}`), ""];
+  if (!r.rows.length) return [rule(`${head} · nothing waiting on you`), ""];
 
-  if (r.note) {
-    out.push(`  ${DIM}skipped — ${r.note}${RESET}`, "");
-    return out;
-  }
-  if (!r.rows.length) {
-    out.push(`  ${DIM}nothing waiting on you${RESET}`);
-  }
+  const out = [rule(`${head} · awaiting your review`), ""];
 
   for (const row of r.rows.slice(0, MAX_ROWS)) {
     // 👀 = your review was actually requested; ✎ = you are already in the
@@ -982,10 +1487,10 @@ function dur(mins: number): string {
 function renderAgenda(a: { events: Meeting[]; note?: string }, now: Date): string[] {
   const out: string[] = [];
 
-  if (a.note) {
-    out.push(rule("AGENDA  📅"), "", `  ${DIM}skipped — ${a.note}${RESET}`, "");
-    return out;
-  }
+  // Collapsed onto the rule -- see the note in renderReviews. A bare
+  // "AGENDA 📅" rule sitting above a lone "skipped" line spent four lines
+  // saying what this says in one.
+  if (a.note) return [rule(`AGENDA  📅 skipped — ${a.note}`), ""];
 
   const allDay = a.events.filter((e) => e.all_day);
   const timed = a.events.filter((e) => !e.all_day);
@@ -994,7 +1499,14 @@ function renderAgenda(a: { events: Meeting[]; note?: string }, now: Date): strin
   const summary = timed.length
     ? `${timed.length} meeting${timed.length === 1 ? "" : "s"} · ${dur(Math.round(booked))} booked`
     : "clear";
-  out.push(rule(`AGENDA  📅 ${now.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })} · ${summary}`), "");
+  const date = now.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+
+  // Nothing at all today -- no meetings and no all-day banners. The rule
+  // already says "clear", so there is no body to print and no reason to open
+  // one.
+  if (!timed.length && !allDay.length) return [rule(`AGENDA  📅 ${date} · clear`), ""];
+
+  out.push(rule(`AGENDA  📅 ${date} · ${summary}`), "");
 
   // Banners first and dim: an OOO or a holiday frames the whole day but is not
   // an appointment, so it sits above the timeline rather than inside it.
@@ -1002,8 +1514,10 @@ function renderAgenda(a: { events: Meeting[]; note?: string }, now: Date): strin
     out.push(`  ${DIM}▫ all-day   ${trunc(e.title, WIDTH - 20)}${RESET}`);
   }
 
+  // All-day banners but no meetings. The rule's "clear" already carries that,
+  // so the old "no meetings today" row was the same fact a second time.
   if (!timed.length) {
-    out.push(`  ${DIM}no meetings today${RESET}`, "");
+    out.push("");
     return out;
   }
 
@@ -1251,16 +1765,11 @@ function renderSentry(s: Awaited<ReturnType<typeof fetchSentry>>, hours: number)
   // "assigned to us" used to sit in this header. Every row in the section is
   // assigned to the team by construction — that IS the query — so it described
   // the code rather than the data and earned none of its width.
-  const out = [rule(`SENTRY  🔥 ${SC_TEAM_NAME} · ${days}d window · 24h rates`), ""];
+  const head = `SENTRY  🔥 ${SC_TEAM_NAME} · ${days}d window`;
+  if (s.note) return [rule(`${head} · skipped — ${s.note}`), ""];
+  if (!s.rows.length) return [rule(`${head} · nothing the team owns fired in 24h`), ""];
 
-  if (s.note) {
-    out.push(`  ${DIM}skipped — ${s.note}${RESET}`, "");
-    return out;
-  }
-  if (!s.rows.length) {
-    out.push(`  ${DIM}nothing the team owns fired in the last 24h${RESET}`, "");
-    return out;
-  }
+  const out = [rule(`${head} · 24h rates`), ""];
 
   const disamb = disambiguators(s.rows.map((r) => ({ issue: r.issue, summary: r.summary })));
 
@@ -1396,21 +1905,41 @@ function renderSentry(s: Awaited<ReturnType<typeof fetchSentry>>, hours: number)
   return out;
 }
 
-async function render(): Promise<string> {
+// Every fetch, once. Both renderers (the terminal text and the Chrome page) read
+// the same Gathered, so the two can never disagree about what is going on.
+interface Gathered {
+  now: Date;
+  start: Date;
+  reviews: Awaited<ReturnType<typeof fetchReviews>>;
+  sentry: Awaited<ReturnType<typeof fetchSentry>>;
+  agenda: ReturnType<typeof fetchAgenda>;
+  myPrs: Awaited<ReturnType<typeof fetchMyPrs>>;
+  shortcut: Awaited<ReturnType<typeof fetchShortcutBrief>>;
+  notion: Awaited<ReturnType<typeof fetchNotionTodos>>;
+}
+
+async function gather(): Promise<Gathered> {
   const now = new Date();
   const start = windowStart(now);
-  const hours = Math.ceil((now.getTime() - start.getTime()) / 3_600_000);
+  const msg = (e: unknown) => (e as Error).message;
 
-  // Both halves run concurrently and neither can take the other down: a
-  // Shortcut outage must not cost you the Sentry section.
-  const [reviews, sentryData] = await Promise.all([
-    fetchReviews().catch((e) => ({ rows: [], note: (e as Error).message })),
-    fetchSentry(now).catch((e) => ({ rows: [], note: (e as Error).message })),
+  // All concurrent, and none can take another down: a Shortcut outage must not
+  // cost you the Sentry section.
+  const [reviews, sentryData, myPrs, sc, notion] = await Promise.all([
+    fetchReviews().catch((e) => ({ rows: [], note: msg(e) })),
+    fetchSentry(now).catch((e) => ({ rows: [], note: msg(e) })),
+    fetchMyPrs().catch((e) => ({ rows: [], note: msg(e) })),
+    fetchShortcutBrief(start).catch((e) => ({ talk: [], mine: [], fresh: [], note: msg(e) })),
+    fetchNotionTodos().catch((e) => ({ current: null, older: [], note: msg(e) })),
   ]);
   // Synchronous and local — a subprocess against EventKit, no network — so it
   // is not worth folding into the Promise.all above.
   const agenda = fetchAgenda();
+  return { now, start, reviews, sentry: sentryData, agenda, myPrs, shortcut: sc, notion };
+}
 
+function render(g: Gathered): string {
+  const { now, start } = g;
   const when = `${now.toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" })}`;
   const since = `${start.toLocaleDateString("en-US", { weekday: "short" })} ${WINDOW_HOUR}:00`;
 
@@ -1418,13 +1947,87 @@ async function render(): Promise<string> {
     "",
     `  ${BOLD}MORNING BRIEF${RESET}  ${DIM}${when} · since ${since}${RESET}`,
     "",
-    ...renderAgenda(agenda, now),
-    ...renderReviews(reviews, now),
-    ...renderSentry(sentryData, SENTRY_WINDOW_HOURS),
+    ...renderAgenda(g.agenda, now),
+    ...renderReviews(g.reviews, now),
+    ...renderSentry(g.sentry, SENTRY_WINDOW_HOURS),
     `${DIM}  ${MY_LOGIN} · generated ${now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}${RESET}`,
     "",
   ];
   return lines.join("\n");
+}
+
+// The Chrome page's input. Sentry is pre-digested here — bucketed, tagged,
+// trended — with the same helpers the terminal renderer uses, so brief-html.ts
+// is pure layout and never re-derives a ranking rule.
+function toModel(g: Gathered): BriefModel {
+  const s = g.sentry;
+  const disamb = disambiguators(s.rows.map((r) => ({ issue: r.issue, summary: r.summary })));
+  const grouped = new Map<Bucket, OwnedRow[]>();
+  for (const r of s.rows) grouped.set(bucketOf(r), [...(grouped.get(bucketOf(r)) ?? []), r]);
+  const prefixless = (i: SentryIssue) => {
+    const p = `${i.project.slug.toUpperCase()}-`;
+    return i.shortId?.startsWith(p) ? i.shortId.slice(p.length) : i.shortId;
+  };
+
+  const bucketDefs: [Bucket, string, string][] = [
+    ["ticketed", "🎫", "on the board"],
+    ["reassign", "↩", "another team"],
+    ["retriedClean", "💤", "self-healed"],
+    ["steady", "·", "flat"],
+  ];
+
+  return {
+    generatedAt: g.now.toISOString(),
+    windowStart: g.start.toISOString(),
+    login: MY_LOGIN,
+    team: SC_TEAM_NAME,
+    agenda: g.agenda,
+    reviews: g.reviews,
+    myPrs: g.myPrs,
+    shortcut: g.shortcut,
+    notion: g.notion,
+    sentry: {
+      note: s.note,
+      windowDays: Math.round(SENTRY_WINDOW_HOURS / 24),
+      novel: (grouped.get("novel") ?? []).map((r) => {
+        const t = trend(Number(r.issue.count), r.baseline);
+        return {
+          tag: r.isRegressed ? "REGRESS" : r.isNew ? "NEW" : isSpike(r) ? "SPIKE" : "",
+          summary: r.summary || r.issue.title,
+          title: r.issue.title,
+          disambiguator: disamb.get(r.issue.id) ?? null,
+          shortId: prefixless(r.issue),
+          url: r.issue.permalink,
+          count: Number(r.issue.count),
+          users: r.issue.userCount,
+          unhandled: r.issue.isUnhandled,
+          finalRetries: r.finalRetries,
+          trend: t.plain,
+          trendDir: r.baseline <= 0 ? "first" : t.plain.startsWith("↑") ? "up" : t.plain.startsWith("↓") ? "down" : "flat",
+          suggestedTeam: r.suggestedTeam,
+          scId: scStoryId(r.issue) ?? null,
+        };
+      }),
+      buckets: bucketDefs
+        .map(([b, glyph, label]) => {
+          const rows = grouped.get(b) ?? [];
+          return {
+            glyph,
+            label,
+            count: rows.length,
+            events: eventTotal(rows),
+            detail:
+              b === "reassign"
+                ? [...new Set(rows.map((r) => r.suggestedTeam).filter(Boolean))].join(", ")
+                : b === "ticketed"
+                  ? ""
+                  : familyBreakdown(rows),
+            stories: b === "ticketed" ? ([...new Set(rows.map((r) => scStoryId(r.issue)).filter(Boolean))] as string[]) : [],
+          };
+        })
+        .filter((b) => b.count > 0),
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,24 +2035,36 @@ async function render(): Promise<string> {
 // ---------------------------------------------------------------------------
 
 function cachePath(d = new Date()): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return path.join(CACHE_DIR, `brief-${y}-${m}-${day}.txt`);
+  return path.join(CACHE_DIR, `brief-${ymd(d)}.txt`);
+}
+
+// The Chrome page. Dated copies are history; today.html is the stable URL the
+// opener (brief-open) looks for among Chrome's tabs, so reopening reloads the
+// tab you already have instead of stacking a new one every morning.
+const HTML_DIR = path.join(CACHE_DIR, "brief");
+const HTML_TODAY = path.join(HTML_DIR, "today.html");
+
+// Both artefacts from ONE gather: the popup text (until the Chrome page
+// replaces it) and the page.
+function writeAll(g: Gathered): { text: string; html: string } {
+  const text = render(g);
+  fs.mkdirSync(HTML_DIR, { recursive: true });
+  fs.writeFileSync(cachePath(g.now), text);
+  const html = renderHtml(toModel(g));
+  fs.writeFileSync(path.join(HTML_DIR, `${ymd(g.now)}.html`), html);
+  // Write-then-rename so a Chrome reload mid-write never sees half a page.
+  const tmp = `${HTML_TODAY}.tmp`;
+  fs.writeFileSync(tmp, html);
+  fs.renameSync(tmp, HTML_TODAY);
+  return { text, html };
 }
 
 async function main() {
   const mode = process.argv[2] ?? "";
 
   if (mode === "--json") {
-    const now = new Date();
-    const [reviews, sentryData] = await Promise.all([
-      fetchReviews().catch((e) => ({ error: (e as Error).message })),
-      fetchSentry(now).catch((e) => ({ error: (e as Error).message })),
-    ]);
-    console.log(
-      JSON.stringify({ windowStart: windowStart(now), agenda: fetchAgenda(), reviews, sentry: sentryData }, null, 2),
-    );
+    const g = await gather();
+    console.log(JSON.stringify({ ...toModel(g), rawSentry: g.sentry }, null, 2));
     return;
   }
 
@@ -1459,10 +2074,7 @@ async function main() {
   if (mode === "--fresh") {
     IGNORE_SUMMARY_CACHE = true;
     WIDTH = BRIEF_WIDTH;
-    const text = await render();
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-    fs.writeFileSync(cachePath(), text);
-    process.stdout.write(text);
+    process.stdout.write(writeAll(await gather()).text);
     return;
   }
 
@@ -1476,25 +2088,21 @@ async function main() {
     // Generate on the spot rather than showing an empty popup. Pinned to
     // BRIEF_WIDTH like --write, because this branch caches what it renders.
     WIDTH = BRIEF_WIDTH;
-    const text = await render();
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-    fs.writeFileSync(p, text);
-    process.stdout.write(text);
+    process.stdout.write(writeAll(await gather()).text);
     return;
   }
 
-  if (mode === "--write") WIDTH = BRIEF_WIDTH;
-  const text = await render();
-
-  if (mode === "--write") {
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-    const p = cachePath();
-    fs.writeFileSync(p, text);
-    console.error(`wrote ${p}`);
+  // What launchd runs at 06:00, and what brief-open runs when today's page is
+  // missing. Prints the page's path so a caller can open it.
+  if (mode === "--write" || mode === "--html") {
+    WIDTH = BRIEF_WIDTH;
+    writeAll(await gather());
+    console.error(`wrote ${cachePath()} and ${HTML_TODAY}`);
+    if (mode === "--html") console.log(HTML_TODAY);
     return;
   }
 
-  process.stdout.write(text);
+  process.stdout.write(render(await gather()));
 }
 
 main().catch((err) => {
