@@ -176,6 +176,45 @@ async function notifyMergeReady(name: string, pr: Pr): Promise<void> {
 //
 // Removed from the set once CI stops failing, so a re-break announces again —
 // which is the whole point on a branch you are pushing fixes to.
+// ── worktrees being removed ─────────────────────────────────────────────────
+//
+// Tombstones, so this daemon does not helpfully rebuild a Space the user just
+// deleted.
+//
+// prefix+shift+D (space-remove-worktree.zsh) closes the Space first, then runs
+// `git worktree remove`, which takes ~17s on popmenu. This loop polls every
+// 30s, and in that window it sees a worktree that is still in
+// `herdr worktree list` with no Space attached — exactly the condition for
+// "create one". So the Space came straight back, and then its directory
+// vanished underneath it.
+//
+// The removal script writes the path here BEFORE it closes anything, so there
+// is no window at all, not even a narrow one.
+//
+// SHORT TTL ON PURPOSE. A tombstone is a lie about the state of the world, and
+// the only safe lie is a brief one: if the removal fails, the worktree is real
+// and should get its Space back on its own, without anyone remembering to
+// clean up a file. Five minutes is comfortably longer than a slow removal plus
+// Herdr's own rescan, and short enough that a failure self-heals before you
+// have finished wondering about it.
+const REMOVING_PATH = path.join(os.homedir(), ".local/state/herdr/removing-worktrees.json");
+
+/** Worktree paths whose tombstone has not expired. Expired entries are simply
+ * ignored; the file is rewritten by whoever next adds one. */
+function readRemoving(): Set<string> {
+  try {
+    const raw = JSON.parse(fs.readFileSync(REMOVING_PATH, "utf8")) as Record<string, number>;
+    const now = Date.now();
+    return new Set(
+      Object.entries(raw)
+        .filter(([, expiresAt]) => typeof expiresAt === "number" && expiresAt > now)
+        .map(([p]) => p),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
 const CI_FAILED_PATH = path.join(os.homedir(), ".local/state/herdr/ci-failed.json");
 
 function readCiFailed(): Set<string> {
@@ -204,9 +243,12 @@ function writeCiFailed(branches: Set<string>): void {
 // expressible; `[ui.toast] delivery = "system"` hands off to macOS Notification
 // Center instead, which persists until dismissed.
 async function notifyCiFailed(name: string, pr: Pr, ci: Ci): Promise<void> {
-  const jobs = ci.failedJobs ?? [];
-  const detail = jobs.length
-    ? jobs.slice(0, 3).map((j) => j.name).join(", ") + (jobs.length > 3 ? `, +${jobs.length - 3} more` : "")
+  // Deduped by name: a parallelised job fails once per container, so the first
+  // real notification read "cypress_e2e_consumer_tests, cypress_e2e_consumer_tests".
+  // The count that matters is distinct jobs, not failed containers.
+  const names = [...new Set((ci.failedJobs ?? []).map((j) => j.name))];
+  const detail = names.length
+    ? names.slice(0, 3).join(", ") + (names.length > 3 ? `, +${names.length - 3} more` : "")
     : "see CircleCI";
   const num = pr.number !== null ? `#${pr.number} ` : "";
   try {
@@ -730,7 +772,11 @@ async function cycle(): Promise<void> {
       continue;
     }
 
-    const syncable = worktrees.filter(isSyncable);
+    // Tombstoned worktrees are dropped from EVERY use of `syncable`, not just
+    // Space creation: painting tokens onto a Space that is being torn down is
+    // the same mistake one step later.
+    const removing = readRemoving();
+    const syncable = worktrees.filter((wt) => isSyncable(wt) && !removing.has(wt.path));
     const skipped = worktrees.length - syncable.length;
     if (skipped) log(`${path.basename(dir)}: skipping ${skipped} bare/detached/prunable worktree(s)`);
 
@@ -859,6 +905,24 @@ async function cycle(): Promise<void> {
     const pushed = await pushedBranches(dir, branches);
     const ciMap = slug ? await ciForRepo(slug, branches, pushed) : new Map<string, Ci>();
     const devDirs = await devServerDirs();
+
+    // Attribute each dev-server cwd to the LONGEST matching worktree path.
+    // A server's cwd can sit in a subdir, and one worktree can nest inside
+    // another's path (popmenu-worktrees/AIM-2.0-Planning-worktrees is real),
+    // so most specific wins. The `.some()` this replaces lit BOTH the outer
+    // and the inner worktree — and now that dev state colours the NAME, a
+    // false positive renames a Space rather than adding a stray glyph.
+    // Ported from cursor-status.ts, which has always done it this way.
+    const devOwner = new Set<string>();
+    for (const cwd of devDirs) {
+      let best = "";
+      for (const { wt } of live) {
+        if (cwd === wt.path || cwd.startsWith(wt.path + path.sep)) {
+          if (wt.path.length > best.length) best = wt.path;
+        }
+      }
+      if (best) devOwner.add(best);
+    }
     const tierMap = await shortcutTiers([...branches]);
 
     // PR + comments on the slow lane; CI and the local signals refresh every cycle.
@@ -922,9 +986,7 @@ async function cycle(): Promise<void> {
         ),
         repo,
         scTier: tierMap.get(wt.branch) as ScTier | undefined,
-        // A dev server's cwd can sit anywhere inside the worktree, not just at
-        // its root, so match on prefix rather than equality.
-        devRunning: [...devDirs].some((d) => d === wt.path || d.startsWith(wt.path + "/")),
+        devRunning: devOwner.has(wt.path),
         comments: cmtMap.get(wt.branch) ?? [],
       };
       // Edge-triggered, and deliberately not gated on DRY_RUN's `continue`
@@ -971,17 +1033,23 @@ async function cycle(): Promise<void> {
         log(`report-metadata failed for ${space.workspace_id}: ${(err as Error).message}`);
       }
     }
-    // Line 1 renders `$wt` and nothing else, so a Space this daemon does not
-    // manage — the ad-hoc one you opened at the repo root, a fresh Space that
-    // has not been reconciled yet — would draw as a bare state icon with no name
-    // at all. Give every remaining Space its Herdr label so none render blank.
+    // Line 1 renders $wtdev/$wtidle and nothing else, so a Space this daemon
+    // does not manage — System, the ad-hoc one you opened at the repo root, a
+    // fresh Space not reconciled yet — would draw as a bare state icon with no
+    // name at all. Give every remaining Space its Herdr label so none render
+    // blank. $wtidle specifically: an unmanaged Space has no worktree, so it
+    // cannot be the one holding :3000 and must never take the green.
+    //
+    // This said `wt` until 2026-10-28, which is what the row used to render.
+    // When the name moved to the colour pair, this was missed and the System
+    // Space went nameless — the token was still pushed, just no longer drawn.
     if (!DRY_RUN) {
       pruneSidecars(new Set(spaces.map((sp) => sp.workspace_id)));
       const named = new Set(live.map(({ space }) => space.workspace_id));
       for (const sp of spaces) {
         if (named.has(sp.workspace_id) || !sp.label) continue;
         try {
-          await reportTokens(sp.workspace_id, { wt: sp.label });
+          await reportTokens(sp.workspace_id, { wtidle: sp.label });
         } catch {
           /* a Space closed mid-cycle — next cycle will not see it */
         }

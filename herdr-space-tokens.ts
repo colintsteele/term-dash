@@ -65,7 +65,18 @@ const GH = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"].find((p) => fs.existsSy
 // signal that disappears (PR merged, CI job fixed) clears instead of lingering
 // until its TTL. Order here is documentation only; row order lives in config.toml.
 export const SPACE_TOKENS = [
-  "wt", // line 1: the Space's display name
+  // Retired: line 1 draws $wtdev/$wtidle now. Kept listed so blankTokens()
+  // still clears the value Herdr holds for it. Safe to drop after one paint.
+  "wt",
+  // Line 1's name, in two colour variants — exactly ONE is ever set. Herdr
+  // colours by token name and a metadata value carries no styling of its own,
+  // so a name that changes colour needs one token per colour. Same shape as
+  // apprg/apprd and the ci* set. $wtdev means this worktree owns DEV_PORT.
+  //
+  // A single set token of a pair renders with no separator; the gap only
+  // appears when BOTH are set (see the apprg/apprd note below), which is why
+  // these two are mutually exclusive rather than one name plus one marker.
+  "wtdev", "wtidle",
   // Line 1 tail: approvals, then exactly one CI token — colour carries the
   // state, so they share a single column between them.
   "appr", // approvals, flush after the name
@@ -456,11 +467,20 @@ export interface SpaceInput {
   comments: CommentSummary[];
 }
 
+// The Space's name, routed to the colour variant that matches dev-server state.
+// Called on BOTH paths through buildTokens, including the isMain early return:
+// running bin/dev from the main checkout is the common case, and leaving it on
+// the non-main path only would make master the one Space that can never light.
+function setName(t: Tokens, i: SpaceInput): void {
+  if (i.devRunning) t.wtdev = i.worktreeName;
+  else t.wtidle = i.worktreeName;
+}
+
 export function buildTokens(i: SpaceInput): Tokens {
   const t = blankTokens();
   // The main checkout has no PR and no branch CI of its own: name only, as before.
   if (i.isMain) {
-    t.wt = i.worktreeName;
+    setName(t, i);
     return t;
   }
 
@@ -482,7 +502,7 @@ export function buildTokens(i: SpaceInput): Tokens {
   // single-cell Nerd Font glyph so the field keeps its width.
   if (approvals > 0) t.apprg = "✓".repeat(approvals);
   if (empty > 0) t.apprd = "-".repeat(empty - 1) + (i.archLock ? ARCH_LOCK : "-");
-  t.wt = i.worktreeName;
+  setName(t, i);
 
   // One circle, coloured by CI state. Hollow when there is nothing to report so
   // the column still holds its width instead of collapsing.
