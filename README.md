@@ -5,6 +5,9 @@ One command (`termdash up`) tiles small, self-refreshing TypeScript widgets into
 a 3-column tmux layout so the state of everything you have in flight — branches,
 CI, AI agents, PRs — sits in one place.
 
+Below the monitor <img width="5712" height="4284" alt="IMG_5425" src="https://github.com/user-attachments/assets/8b8d7529-4ce2-4ff0-8cb0-3de2543c0370" />
+
+
 <details open>
 <summary><h2>What it does &amp; how it works</h2></summary>
 
