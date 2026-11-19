@@ -10,8 +10,8 @@
 # morning, and tabjump can't help: it deliberately ignores file:// URLs. So the
 # script below looks for a tab already showing today.html. If it finds one it
 # reloads it, selects it and raises its window; otherwise it opens a new tab in
-# the front window. Then it centres that window on the primary display and
-# activates Chrome, so the brief is literally front and centre.
+# the front window. Then it sizes that window to 2431x1645, centres it on the
+# primary display, and activates Chrome, so the brief is literally front and centre.
 #
 # FIRST RUN: macOS will ask whether the calling process may control Google
 # Chrome (System Settings → Privacy & Security → Automation). Run
@@ -92,14 +92,17 @@ function run([pid, target]) {
   }
   win.index = 1;
 
-  // Centre it on the primary display (the one with the menu bar), keeping its
-  // size unless it is larger than the screen. Cocoa's visibleFrame is
-  // bottom-left-origin; Chrome's bounds are top-left, hence the flip.
+  // Centre it on the primary display (the one with the menu bar) at a FIXED
+  // size. Keeping whatever size the window happened to have meant the brief
+  // came up cramped some mornings; 2431x1645 is the size Colin picked by hand
+  // (2026-11-18). Clamped to the screen so a smaller display still fits.
+  // Cocoa's visibleFrame is bottom-left-origin; Chrome's bounds are top-left,
+  // hence the flip.
+  const WIDTH = 2431, HEIGHT = 1645;
   const screen = $.NSScreen.screens.objectAtIndex(0);
   const full = screen.frame, vis = screen.visibleFrame;
   const visTop = full.size.height - (vis.origin.y + vis.size.height);
-  const b = win.bounds();
-  const w = Math.min(b.width, vis.size.width), h = Math.min(b.height, vis.size.height);
+  const w = Math.min(WIDTH, vis.size.width), h = Math.min(HEIGHT, vis.size.height);
   win.bounds = {
     x: Math.round(vis.origin.x + (vis.size.width - w) / 2),
     y: Math.round(visTop + (vis.size.height - h) / 2),

@@ -338,6 +338,101 @@ async function ensureSummaries(issues: SentryIssue[]): Promise<Map<string, strin
   return out;
 }
 
+// ---- expandable explanations ----
+// The one-liner says WHAT broke; it does not say what that code is for, or what
+// it costs anyone. Each row the brief keeps visible gets a few sentences more,
+// folded under the row in the Chrome page. Same machinery as the one-liners —
+// one batched `claude -p`, cached per issue on title+culprit, raw-title-free
+// fallback (no explanation, no fold) on any failure — but written from the
+// latest event's digest (exception message, deepest in-app frames, transaction),
+// because the title alone is what made the one-liner necessary in the first place.
+const EXPLAIN_CACHE = path.join(CACHE_DIR, "sentry-explanations.json");
+const EXPLAIN_MAX = 420;
+
+async function ensureExplanations(rows: OwnedRow[]): Promise<Map<string, string>> {
+  let cache: Record<string, SummaryEntry> = {};
+  try {
+    cache = JSON.parse(fs.readFileSync(EXPLAIN_CACHE, "utf8")) as Record<string, SummaryEntry>;
+  } catch {
+    /* first run */
+  }
+  const out = new Map<string, string>();
+  const missing: OwnedRow[] = [];
+  for (const r of rows) {
+    const hit = IGNORE_SUMMARY_CACHE ? undefined : cache[r.issue.id];
+    if (hit && hit.key === summaryKey(r.issue)) out.set(r.issue.id, hit.summary);
+    else missing.push(r);
+  }
+  if (!missing.length || !SUMMARIES_ENABLED) return out;
+
+  const prompt = [
+    `You are briefing an engineer on the Popmenu Rails app (restaurant websites, online ordering,`,
+    `marketing campaigns, reservations integrations) about Sentry issues their team owns.`,
+    `For each issue write 2-3 plain-English sentences: what this code is trying to do,`,
+    `what is going wrong, and who or what is affected when it fails.`,
+    ``,
+    `Rules:`,
+    `- Hard limit ${EXPLAIN_MAX} characters each.`,
+    `- Ground every claim in the evidence given. If impact or cause is unclear, say so briefly; don't invent.`,
+    `- Mention a specific file or job name when it helps locate the code.`,
+    `- No markdown, no emoji, no bullet points.`,
+    ``,
+    `Return ONLY a JSON object mapping id to explanation, no prose and no code fence.`,
+    ``,
+    ...missing.map((r) =>
+      [
+        `### ${r.issue.id}`,
+        `title: ${r.issue.title}`,
+        `culprit: ${r.issue.culprit ?? ""}`,
+        `project: ${r.issue.project.slug}`,
+        `events in 24h: ${r.issue.count}; users: ${r.issue.userCount}; unhandled: ${r.issue.isUnhandled}`,
+        r.finalRetries ? `sidekiq jobs that exhausted retries in 24h: ${r.finalRetries}` : "",
+        r.digest,
+        ``,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    ),
+  ].join("\n");
+
+  let raw: string;
+  try {
+    raw = execFileSync("claude", ["-p", prompt], {
+      encoding: "utf8",
+      timeout: SUMMARY_TIMEOUT_MS,
+      cwd: os.tmpdir(), // see ensureSummaries
+      stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: 4 * 1024 * 1024,
+    });
+  } catch {
+    return out;
+  }
+
+  let parsed: Record<string, string>;
+  try {
+    const m = raw.match(/\{[\s\S]*\}/);
+    parsed = m ? (JSON.parse(m[0]) as Record<string, string>) : {};
+  } catch {
+    return out;
+  }
+
+  const now = new Date().toISOString();
+  for (const r of missing) {
+    const s = (parsed[r.issue.id] ?? "").trim();
+    if (!s) continue;
+    const clean = trunc(s, EXPLAIN_MAX);
+    out.set(r.issue.id, clean);
+    cache[r.issue.id] = { key: summaryKey(r.issue), summary: clean, at: now };
+  }
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(EXPLAIN_CACHE, JSON.stringify(cache, null, 2));
+  } catch {
+    /* regenerate next time */
+  }
+  return out;
+}
+
 // Trend bands. Inside these the day is normal and the row says "steady".
 const TREND_UP = 1.25;
 const TREND_DOWN = 0.75;
@@ -441,6 +536,7 @@ interface ReviewRow {
   touchedByMe: boolean; // commented, but never submitted a formal review
   approvedByOthers: boolean;
   requestedOfMe: boolean; // I am currently a requested reviewer
+  needsLead: boolean; // LEAD_REVIEW_TEAM requested, no lead approved yet — see leadMembers
   reReview: boolean; // I reviewed once already and it has come back to me
   interacted: boolean; // I have reviewed or commented on it at some point
   effort: Effort | null; // pr-effort.ts rating, shared with git-notiql
@@ -529,6 +625,29 @@ function prReadyAt(pr: { createdAt: string; timelineItems: { nodes: { createdAt?
   return latest > pr.createdAt ? latest : pr.createdAt;
 }
 
+// The CODEOWNERS team whose approval popmenu requires (migrations, schema, sidekiq
+// config, ...). Same team git-notiql.ts splits out as 👔. A PR NEEDS A LEAD when the
+// team is a requested reviewer and no member's latest review is an approval; the
+// request alone isn't enough, because GitHub leaves it in place after leads approve
+// (see LEAD_REVIEW_TEAM in git-notiql.ts). I'm a lead, so these are mine to unblock,
+// and they list first.
+const LEAD_REVIEW_TEAM = "Popmenu/lead-reviewers";
+
+// Lowercased logins of the lead team, or null when the token can't read team
+// membership (needs read:org); then a team request alone counts as needing a lead.
+async function leadMembers(): Promise<Set<string> | null> {
+  const [org, slug] = LEAD_REVIEW_TEAM.split("/");
+  try {
+    const data = await graphql<{ organization: { team: { members: { nodes: { login: string }[] } } | null } | null }>(
+      `query { organization(login: "${org}") { team(slug: "${slug}") { members(first: 100) { nodes { login } } } } }`,
+    );
+    const nodes = data.organization?.team?.members.nodes;
+    return nodes ? new Set(nodes.map((n) => n.login.toLowerCase())) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchReviews(): Promise<{ rows: ReviewRow[]; note?: string }> {
   if (!SHORTCUT_TOKEN) return { rows: [], note: "SHORTCUT_RO_TOKEN not set" };
   if (!GITHUB_TOKEN) return { rows: [], note: "GITHUB_TOKEN not set" };
@@ -595,7 +714,8 @@ async function fetchReviews(): Promise<{ rows: ReviewRow[]; note?: string }> {
     }
     reviews(first: 20, author: "${MY_LOGIN}") { nodes { state submittedAt } }
     comments(last: 50) { nodes { author { login } } }
-    reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
+    reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } ... on Team { combinedSlug } } } }
+    latestReviews(first: 50) { nodes { state author { login } } }
   `;
   const query = `query {
     ${candidates
@@ -616,7 +736,8 @@ async function fetchReviews(): Promise<{ rows: ReviewRow[]; note?: string }> {
     timelineItems: { nodes: { createdAt?: string }[] };
     reviews: { nodes: { state: string; submittedAt: string | null }[] };
     comments: { nodes: { author: { login: string } | null }[] };
-    reviewRequests: { nodes: { requestedReviewer: { login?: string } | null }[] };
+    reviewRequests: { nodes: { requestedReviewer: { login?: string; combinedSlug?: string } | null }[] };
+    latestReviews: { nodes: { state: string; author: { login: string } | null }[] };
     additions: number;
     deletions: number;
     changedFiles: number;
@@ -627,7 +748,10 @@ async function fetchReviews(): Promise<{ rows: ReviewRow[]; note?: string }> {
     reviewThreads: { nodes: { comments: { totalCount: number } }[] };
   };
 
-  const data = await graphql<Record<string, { pullRequest: GqlPr | null }>>(query);
+  const [data, leads] = await Promise.all([
+    graphql<Record<string, { pullRequest: GqlPr | null }>>(query),
+    leadMembers(),
+  ]);
 
   const rows: ReviewRow[] = [];
 
@@ -652,6 +776,17 @@ async function fetchReviews(): Promise<{ rows: ReviewRow[]; note?: string }> {
     const requestedOfMe = pr.reviewRequests.nodes.some((n) => n.requestedReviewer?.login === MY_LOGIN);
     const neverReviewed = mine.length === 0;
 
+    // Waiting on a lead (see LEAD_REVIEW_TEAM). Mine to unblock even if I've
+    // reviewed before — unless my latest review asked for changes, which puts
+    // the next move with the author.
+    const leadRequested = pr.reviewRequests.nodes.some(
+      (n) => n.requestedReviewer?.combinedSlug?.toLowerCase() === LEAD_REVIEW_TEAM.toLowerCase(),
+    );
+    const leadApproved = pr.latestReviews.nodes.some(
+      (r) => r.state === "APPROVED" && r.author !== null && (leads?.has(r.author.login.toLowerCase()) ?? false),
+    );
+    const needsLead = leadRequested && !leadApproved && latest?.state !== "CHANGES_REQUESTED";
+
     // THE WHOLE FILTER: the ball has to be in my court. Either I have never put
     // a review on this PR, or I have and it has been sent back to me.
     //
@@ -659,7 +794,7 @@ async function fetchReviews(): Promise<{ rows: ReviewRow[]; note?: string }> {
     // re-requested — which covers both "I approved" and "I requested changes and
     // am waiting on the author". Those are the author's move, not mine, and they
     // are what used to pad this section out.
-    if (!neverReviewed && !requestedOfMe) return;
+    if (!neverReviewed && !requestedOfMe && !needsLead) return;
 
     const commented = pr.comments.nodes.some((n) => n.author?.login === MY_LOGIN);
     const touchedByMe = neverReviewed && commented;
@@ -679,6 +814,7 @@ async function fetchReviews(): Promise<{ rows: ReviewRow[]; note?: string }> {
       touchedByMe,
       approvedByOthers: pr.reviewDecision === "APPROVED",
       requestedOfMe,
+      needsLead,
       reReview: !neverReviewed,
       interacted: !neverReviewed || commented,
       effort: null, // filled in below, once every row is known
@@ -716,9 +852,12 @@ async function fetchReviews(): Promise<{ rows: ReviewRow[]; note?: string }> {
   ).catch(() => false);
   for (const r of rows) r.effort = effortOf(r.repo, r.number) ?? null;
 
-  // Quick reviews first, as in git-notiql; oldest first within an effort level.
+  // Waiting on a lead first: it blocks the merge and only a lead can clear it.
+  // Then quick reviews first, as in git-notiql; oldest first within an effort level.
   const rank = (r: ReviewRow) => (r.effort ? EFFORT_RANK[r.effort] : 3);
-  rows.sort((a, b) => rank(a) - rank(b) || (a.readyAt < b.readyAt ? -1 : 1));
+  rows.sort(
+    (a, b) => Number(b.needsLead) - Number(a.needsLead) || rank(a) - rank(b) || (a.readyAt < b.readyAt ? -1 : 1),
+  );
 
   return { rows };
 }
@@ -864,6 +1003,8 @@ interface OwnedRow {
   finalRetries: number; // events in the last 24h that exhausted Sidekiq retries
   suggestedTeam: string | null; // another team's product area — advice only, never acted on
   summary: string; // short plain-English line; falls back to the raw Sentry title
+  digest: string; // latest event boiled down (fetchLatest) — the explanation's evidence
+  explanation: string | null; // a few sentences on what this is; novel rows only, see ensureExplanations
 }
 
 // How many of an issue's last-24h events exhausted their Sidekiq retries.
@@ -900,27 +1041,53 @@ async function fetchFinalRetries(ids: string[]): Promise<Map<string, number>> {
   return out;
 }
 
-// In-app stack frame paths for one issue's latest event. One request per issue,
-// which is only affordable because this runs once a day over ~14 issues — do not
-// copy this into a poll loop.
-async function fetchFrames(issueId: string): Promise<string[]> {
+// One issue's latest event, boiled down to two things: the in-app stack frame
+// paths (for suggestedTeam) and a short plain-text digest of the event — the
+// exception message, the deepest in-app frames, the transaction — which is what
+// the expandable explanation is written from (see ensureExplanations). One
+// request per issue, which is only affordable because this runs once a day over
+// ~14 issues — do not copy this into a poll loop.
+interface LatestEvent {
+  frames: string[];
+  digest: string;
+}
+
+async function fetchLatest(issueId: string): Promise<LatestEvent> {
   const res = await fetch(`${SENTRY_API}/issues/${issueId}/events/latest/`, {
     headers: { Authorization: `Bearer ${SENTRY_TOKEN}` },
   });
-  if (!res.ok) return []; // no frames -> no suggestion, which is the safe default
+  if (!res.ok) return { frames: [], digest: "" }; // no frames -> no suggestion, which is the safe default
+  type Frame = { inApp?: boolean; filename?: string; function?: string; lineNo?: number };
   const json = (await res.json()) as {
-    entries?: { type: string; data?: { values?: { stacktrace?: { frames?: { inApp?: boolean; filename?: string }[] } }[] } }[];
+    message?: string;
+    tags?: { key: string; value: string }[];
+    entries?: {
+      type: string;
+      data?: { values?: { type?: string; value?: string; stacktrace?: { frames?: Frame[] } }[] };
+    }[];
   };
-  const out: string[] = [];
+  const frames: string[] = [];
+  const digest: string[] = [];
   for (const entry of json.entries ?? []) {
     if (entry.type !== "exception") continue;
     for (const v of entry.data?.values ?? []) {
-      for (const f of v.stacktrace?.frames ?? []) {
-        if (f.inApp && f.filename) out.push(f.filename);
+      const inApp = (v.stacktrace?.frames ?? []).filter((f) => f.inApp && f.filename);
+      for (const f of inApp) frames.push(f.filename!);
+      if (v.type || v.value) digest.push(`exception: ${v.type ?? ""}: ${trunc(v.value ?? "", 300)}`);
+      // Sentry orders frames outermost first; the last few in-app ones are where
+      // our code actually was when it blew up.
+      for (const f of inApp.slice(-5).reverse()) {
+        digest.push(`  at ${f.filename}${f.lineNo ? `:${f.lineNo}` : ""}${f.function ? ` in ${f.function}` : ""}`);
       }
     }
   }
-  return out;
+  const tag = (k: string) => json.tags?.find((t) => t.key === k)?.value;
+  for (const k of ["transaction", "sidekiq.job", "url"]) {
+    const v = tag(k);
+    if (v) digest.push(`${k}: ${trunc(v, 160)}`);
+  }
+  if (!digest.length && json.message) digest.push(`message: ${trunc(json.message, 300)}`);
+  return { frames, digest: digest.join("\n") };
 }
 
 // Used by BOTH the ranking and the row tag. They disagreed once; sharing the
@@ -962,9 +1129,9 @@ async function fetchSentry(now: Date): Promise<{ rows: OwnedRow[]; note?: string
   for (const i of [...pool, ...regressed]) byId.set(i.id, i);
 
   const live = [...byId.values()].filter((i) => Number(i.count) > 0);
-  const [deadJobs, frameLists, summaries] = await Promise.all([
+  const [deadJobs, latest, summaries] = await Promise.all([
     fetchFinalRetries(live.map((i) => i.id)),
-    Promise.all(live.map((i) => fetchFrames(i.id))),
+    Promise.all(live.map((i) => fetchLatest(i.id))),
     ensureSummaries(live),
   ]);
 
@@ -983,10 +1150,18 @@ async function fetchSentry(now: Date): Promise<{ rows: OwnedRow[]; note?: string
         isNew: newIds.has(issue.id),
         isRegressed: regressedIds.has(issue.id),
         finalRetries: deadJobs.get(issue.id) ?? 0,
-        suggestedTeam: suggestedTeam(issue, frameLists[idx] ?? []),
+        suggestedTeam: suggestedTeam(issue, latest[idx]?.frames ?? []),
         summary: summaries.get(issue.id) ?? issue.title,
+        digest: latest[idx]?.digest ?? "",
+        explanation: null as string | null,
       };
     });
+
+  // Only the rows that stay visible ("novel") get the longer explanation; the
+  // collapsed buckets are by definition the ones you don't need to read about.
+  const novel = rows.filter((r) => bucketOf(r) === "novel");
+  const explanations = await ensureExplanations(novel);
+  for (const r of novel) r.explanation = explanations.get(r.issue.id) ?? null;
 
   // Rank by what it would cost to ignore the row: something you believed fixed,
   // then something you have never seen, then something climbing, then volume.
@@ -1425,7 +1600,11 @@ function renderReviews(r: Awaited<ReturnType<typeof fetchReviews>>, now: Date): 
   if (r.note) return [rule(`${head} · skipped — ${r.note}`), ""];
   if (!r.rows.length) return [rule(`${head} · nothing waiting on you`), ""];
 
-  const out = [rule(`${head} · awaiting your review`), ""];
+  const leadCount = r.rows.filter((row) => row.needsLead).length;
+  const out = [
+    rule(`${head} · awaiting your review${leadCount ? ` · 👔 ${leadCount} need${leadCount === 1 ? "s" : ""} a lead` : ""}`),
+    "",
+  ];
 
   for (const row of r.rows.slice(0, MAX_ROWS)) {
     // 👀 = your review was actually requested; ✎ = you are already in the
@@ -1433,7 +1612,8 @@ function renderReviews(r: Awaited<ReturnType<typeof fetchReviews>>, now: Date): 
     // first thing on the line because it is the only field that changes how you
     // triage the row. All three markers occupy TWO columns — 👀/🤝 are naturally
     // wide and ✎ is padded to match — so the rest of the row stays on a grid.
-    const marker = row.requestedOfMe ? "👀" : row.touchedByMe ? "✎ " : "🤝";
+    // 👔 = waiting on a lead reviewer (sorted first), and outranks the rest.
+    const marker = row.needsLead ? "👔" : row.requestedOfMe ? "👀" : row.touchedByMe ? "✎ " : "🤝";
     const num = `#${row.number}`;
     const when = stamp(row.readyAt, now);
     const story = `sc-${row.storyId}`;
@@ -1447,7 +1627,7 @@ function renderReviews(r: Awaited<ReturnType<typeof fetchReviews>>, now: Date): 
     // the PR ends up describing neither. The 17 columns they cost are worth more
     // spent on the title, and the real size is one click away on the number.
     const prefix = `  ${marker} ${pad(num, 7)} ${pad(row.author, 14)} ${pad(when, 9)} `;
-    const suffix = `${row.reReview ? " ↩re-review" : ""}${row.approvedByOthers ? " ✓others" : ""}  ${story}`;
+    const suffix = `${row.needsLead ? " needs lead" : ""}${row.reReview ? " ↩re-review" : ""}${row.approvedByOthers ? " ✓others" : ""}  ${story}`;
     // Popmenu PR titles end in "[sc 174384]", and the row already carries that
     // ticket as its own linked column — so the tag in the title is the same fact
     // twice, eating width that the actual subject needs.
@@ -1457,6 +1637,7 @@ function renderReviews(r: Awaited<ReturnType<typeof fetchReviews>>, now: Date): 
     out.push(
       `  ${marker} ${BOLD}${link(pad(num, 7), row.url)}${RESET} ${pad(row.author, 14)} ` +
         `${DIM}${pad(when, 9)}${RESET} ${title}` +
+        (row.needsLead ? ` ${BOLD}${RED}needs lead${RESET}` : "") +
         (row.reReview ? ` ${DIM}${YELLOW}↩re-review${RESET}` : "") +
         (row.approvedByOthers ? ` ${DIM}${GREEN}✓others${RESET}` : "") +
         `  ${DIM}${link(story, `https://app.shortcut.com/popmenu/story/${row.storyId}`)}${RESET}`,
@@ -1994,6 +2175,7 @@ function toModel(g: Gathered): BriefModel {
         return {
           tag: r.isRegressed ? "REGRESS" : r.isNew ? "NEW" : isSpike(r) ? "SPIKE" : "",
           summary: r.summary || r.issue.title,
+          explanation: r.explanation,
           title: r.issue.title,
           disambiguator: disamb.get(r.issue.id) ?? null,
           shortId: prefixless(r.issue),

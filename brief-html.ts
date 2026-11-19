@@ -50,6 +50,7 @@ export interface BriefModel {
       storyId: number;
       readyAt: string;
       requestedOfMe: boolean;
+      needsLead: boolean;
       reReview: boolean;
       touchedByMe: boolean;
       approvedByOthers: boolean;
@@ -73,6 +74,7 @@ export interface BriefModel {
     novel: {
       tag: string;
       summary: string;
+      explanation: string | null; // a few sentences, folded under the row
       title: string;
       disambiguator: string | null;
       shortId: string;
@@ -257,6 +259,7 @@ function diff(label: string, hint: string, add: number, del: number, files: numb
 function reviewCard(x: ReviewCard, now: Date): string {
   const [label, tone] = x.effort ? EFFORT_TAG[x.effort] : ["UNRATED", "gray"];
   const flags = [
+    x.needsLead ? `<span class="lead">👔 needs a lead reviewer</span>` : "",
     x.reReview ? `<span class="advice">re-review requested</span>` : "",
     !x.reReview && x.interacted ? "you've commented" : "",
     !x.interacted && x.requestedOfMe ? "requested of you" : "",
@@ -281,8 +284,11 @@ function reviewCard(x: ReviewCard, now: Date): string {
 // things of you: a fresh read versus picking a thread back up.
 function reviewsSection(m: BriefModel, now: Date): string {
   const r = m.reviews;
-  const fresh = r.rows.filter((x) => !x.interacted);
-  const been = r.rows.filter((x) => x.interacted);
+  // Waiting on a lead goes first, on its own (morning-brief.ts LEAD_REVIEW_TEAM):
+  // it blocks the merge and only a lead can clear it.
+  const lead = r.rows.filter((x) => x.needsLead);
+  const fresh = r.rows.filter((x) => !x.needsLead && !x.interacted);
+  const been = r.rows.filter((x) => !x.needsLead && x.interacted);
   const group = (title: string, rows: ReviewCard[]) =>
     rows.length
       ? `<h4>${esc(title)} <span class="dim">${rows.length}</span></h4>${rows.map((x) => reviewCard(x, now)).join("")}`
@@ -292,7 +298,9 @@ function reviewsSection(m: BriefModel, now: Date): string {
     "🤝",
     "Reviews you owe",
     { note: r.note, empty: r.rows.length ? undefined : "nothing waiting on you", count: r.rows.length },
-    group("New to you", fresh) + group("You've been here", been),
+    (lead.length ? group("👔 Needs a lead reviewer", lead) : "") +
+      group("New to you", fresh) +
+      group("You've been here", been),
   );
 }
 
@@ -482,10 +490,15 @@ function sentrySection(m: BriefModel): string {
         x.scId ? `<span class="ref">sc-${esc(x.scId)}</span>` : "",
       ].filter(Boolean);
       const title = `${esc(x.summary)}${x.disambiguator ? ` <span class="dim">· ${esc(x.disambiguator)}</span>` : ""}`;
-      return row(x.url, x.tag ? tag(x.tag, tone[x.tag]) : tag("FIRING", "gray"), title, meta.join(" · ")).replace(
+      const r = row(x.url, x.tag ? tag(x.tag, tone[x.tag]) : tag("FIRING", "gray"), title, meta.join(" · ")).replace(
         '<a class="row"',
         `<a class="row" title="${esc(x.title)}"`,
       );
+      // A sibling of the row, not inside it: the row is an <a>, and a click on
+      // the fold has to open the fold, not Sentry.
+      return x.explanation
+        ? r + `<details class="explain"><summary>what is this?</summary><p>${esc(x.explanation)}</p></details>`
+        : r;
     })
     .join("");
 
@@ -723,12 +736,17 @@ a.ref:hover { text-decoration: underline; }
 .dim { color: var(--dim); }
 .hot { color: var(--red); }
 .advice { color: var(--yellow); }
+.lead { color: var(--red); font-weight: 600; }
 .trend.up { color: var(--orange); } .trend.down { color: var(--green); }
 .tag { flex: none; width: 84px; text-align: center; font: 700 10.5px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 0.04em; padding: 4px 0; border-radius: 4px; border: 1px solid currentColor; position: relative; top: -1px; }
 .tag.red { color: var(--red); } .tag.orange { color: var(--orange); } .tag.yellow { color: var(--yellow); } .tag.green { color: var(--green); }
 .tag.blue { color: var(--blue); } .tag.magenta { color: var(--magenta); } .tag.gray { color: var(--gray); }
 details { border-top: 1px solid var(--line); }
 summary { cursor: pointer; padding: 9px 18px; color: var(--dim); font-size: 14px; }
+/* Sentry "what is this?" — indented to sit under the title, past the 84px tag. */
+details.explain { border-top: none; }
+details.explain summary { padding: 0 18px 8px 114px; margin-top: -4px; font-size: 12.5px; }
+details.explain p { margin: 0; padding: 0 18px 10px 114px; font-size: 13.5px; line-height: 1.45; }
 summary:hover { color: var(--fg); }
 .buckets { border-top: 1px solid var(--line); padding: 8px 18px 2px; color: var(--dim); font-size: 13.5px; }
 .buckets p { margin: 0 0 4px; }
