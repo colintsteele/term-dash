@@ -45,6 +45,11 @@
  * prompt — which starts sshd and installs the LaunchDaemon that brings it back
  * at every boot. Liveness comes from netstat rather than lsof; see
  * isPortListening for why an lsof probe reports it down the entire time it is up.
+ * An open port isn't a working login, though, so once a minute the cell also logs
+ * in for real (probeSshLogin): ✓ a login worked, ? only the port is known (run
+ * bin/ssh-probe-setup.sh), red "login refused" sshd turned it down, with
+ * "Remote Login off" when launchd has Apple's sshd disabled (Kandji does this
+ * while the Settings toggle still reads on).
  *
  * Command/ctrl-click CPU or MEM to launch Activity Monitor — its path is
  * resolved via Spotlight (mdfind) rather than hardcoded, since it moved
@@ -90,10 +95,11 @@
 import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const POLL_SECONDS = 5; // local, cheap — fine to check often
 const PORT_TO_WATCH = 3000;
 
@@ -107,6 +113,16 @@ const SSH_PORT = 2223;
 // LaunchServices launches apps and merely opens scripts. Same constraint the
 // Activity Monitor links work around.
 const SSH_START_APP = path.join(os.homedir(), "Applications", "Start SSH 2223.app");
+// A listening port isn't a working login: sshd can be up, accept the laptop's key
+// and still refuse at PAM's account step ("Access denied ... by PAM account
+// configuration"), which is what Kandji's "Disable Remote Login" led to. So the
+// cell logs in for real, as the laptop would, with a key that can only run `true`
+// from this machine (bin/ssh-probe-setup.sh makes and authorizes it). Each try
+// writes a line to sshd's log, so it runs once a minute, not every poll.
+const SSH_PROBE_KEY = path.join(os.homedir(), ".ssh", "term-dash-probe");
+const SSH_PROBE_EVERY_MS = 60_000;
+// Where Remote Login is switched, for the refused state's command-click.
+const SHARING_SETTINGS_URL = "x-apple.systempreferences:com.apple.Sharing-Settings.extension";
 
 // API-key expiry. Written by ~/.zsh-sources/bin/key-check, which a launchd agent
 // runs daily. We only read the cache — never keys.zsh itself — so this widget
@@ -570,14 +586,65 @@ function describePort(port: { command: string; pid: number } | null, devMemKb: n
   return `${color}:${PORT_TO_WATCH} ${port.command}${RESET}${mem}`;
 }
 
-// The SSH cell: quiet ✓ while the door is open, red ✗ when it is not — and when
-// it is not, the label is one command-click from fixing itself. Only the broken
-// state carries the link, since clicking a healthy cell would raise a password
-// prompt in order to do nothing.
-function describeSsh(up: boolean, startUrl: string | null): string {
-  if (up) return `${DIM}SSH :${SSH_PORT} ✓${RESET}`;
-  const label = `SSH :${SSH_PORT} ✗`;
-  return `${RED}${startUrl ? link(label, startUrl) : label}${RESET}`;
+// ---- SSH login probe ----
+
+// "ok": a login completed. "refused": sshd answered and turned the login down.
+// "unprobed": no probe key yet (bin/ssh-probe-setup.sh), so only the port is known.
+// "error": anything else (timeout, connection reset), which says nothing either way.
+type SshLogin = "ok" | "refused" | "unprobed" | "error";
+
+let sshProbe: { at: number; result: SshLogin } | null = null;
+
+async function probeSshLogin(): Promise<SshLogin> {
+  if (sshProbe && Date.now() - sshProbe.at < SSH_PROBE_EVERY_MS) return sshProbe.result;
+  let result: SshLogin;
+  if (!fs.existsSync(SSH_PROBE_KEY)) result = "unprobed";
+  else {
+    try {
+      await execFileAsync("ssh", [
+        "-p", String(SSH_PORT), "-i", SSH_PROBE_KEY,
+        "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=4",
+        "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+        `${os.userInfo().username}@127.0.0.1`, "true",
+      ], { timeout: 8000 });
+      result = "ok";
+    } catch (err) {
+      const stderr = String((err as { stderr?: string }).stderr ?? "");
+      result = /Permission denied|Connection closed by .*port/i.test(stderr) ? "refused" : "error";
+    }
+  }
+  sshProbe = { at: Date.now(), result };
+  return result;
+}
+
+// Whether launchd has Apple's sshd (Remote Login, port 22) switched off. The
+// Settings toggle can read "on" while this says disabled: Kandji turns the
+// service off directly. Shown only to explain a refused login.
+async function isRemoteLoginDisabled(): Promise<boolean> {
+  try {
+    const { stdout } = await execAsync("launchctl print-disabled system");
+    return /"com\.openssh\.sshd" => (disabled|true)/.test(stdout);
+  } catch {
+    return false;
+  }
+}
+
+// The SSH cell: quiet ✓ while a login works, red when it does not — and the red
+// label is one command-click from the fix. Down: the Start SSH app. Refused:
+// Sharing settings, where Remote Login is switched. Only broken states carry a
+// link, since clicking a healthy cell would do nothing useful.
+function describeSsh(up: boolean, login: SshLogin, remoteLoginOff: boolean, startUrl: string | null): string {
+  if (!up) {
+    const label = `SSH :${SSH_PORT} ✗`;
+    return `${RED}${startUrl ? link(label, startUrl) : label}${RESET}`;
+  }
+  if (login === "refused") {
+    const label = `SSH :${SSH_PORT} ✗ login refused${remoteLoginOff ? " · Remote Login off" : ""}`;
+    return `${RED}${link(label, SHARING_SETTINGS_URL)}${RESET}`;
+  }
+  // Listening, and the login either worked or couldn't be tried: "?" marks the
+  // second, so a bare port check never looks like a proven login.
+  return `${DIM}SSH :${SSH_PORT} ${login === "ok" ? "✓" : "?"}${RESET}`;
 }
 
 // ---- Activity Monitor location, resolved once via Spotlight (not hardcoded —
@@ -1057,6 +1124,8 @@ interface Vitals {
   swapUsedKb: number | null;
   activityMonitorUrl: string | null;
   sshUp: boolean;
+  sshLogin: SshLogin;
+  remoteLoginOff: boolean;
   sshStartUrl: string | null;
   meeting: MeetingReport | null;
   keys: Segment;
@@ -1098,7 +1167,7 @@ function buildRightVariants(v: Vitals): string[] {
       : `${DIM}${memLabel}${RESET}`;
 
   const swap = describeSwap(v.swapUsedKb);
-  const ssh = describeSsh(v.sshUp, v.sshStartUrl);
+  const ssh = describeSsh(v.sshUp, v.sshLogin, v.remoteLoginOff, v.sshStartUrl);
   const port = describePort(v.portProcess, v.devMemKb);
   // SSH and SWAP ride in both variants; the dev-server readout is the one that
   // sheds on a narrow terminal. You can confirm :3000 by glancing at the browser,
@@ -1186,7 +1255,7 @@ async function loop(): Promise<void> {
   try {
     // Independent reads, so they all go out at once; the process-tree walk that
     // joins the port lookup to `ps` is pure in-memory work once both have landed.
-    const [cpuPct, memPct, swapUsedKb, portProcess, procs, activityMonitorUrl, meeting, sshUp] =
+    const [cpuPct, memPct, swapUsedKb, portProcess, procs, activityMonitorUrl, meeting, sshUp, sshLogin, remoteLoginOff] =
       await Promise.all([
         getCpuPercent(),
         getMemoryPercent(),
@@ -1196,6 +1265,8 @@ async function loop(): Promise<void> {
         getActivityMonitorUrl(),
         getNextMeeting(),
         isPortListening(SSH_PORT),
+        probeSshLogin(),
+        isRemoteLoginDisabled(),
       ]);
     render({
       now: new Date(),
@@ -1206,6 +1277,8 @@ async function loop(): Promise<void> {
       swapUsedKb,
       activityMonitorUrl,
       sshUp,
+      sshLogin,
+      remoteLoginOff,
       sshStartUrl: getSshStartUrl(),
       meeting,
       keys: describeKeys(readKeyReport()),
@@ -1250,6 +1323,8 @@ if (process.argv.includes("--mock")) {
     // Rendered down, because red is the state worth eyeballing — the healthy one
     // is a dim tick you will see every other minute of the day.
     sshUp: false,
+    sshLogin: "unprobed",
+    remoteLoginOff: false,
     sshStartUrl: "file:///Users/you/Applications/Start%20SSH%202223.app",
     meeting: {
       checked_at: new Date().toISOString(),
