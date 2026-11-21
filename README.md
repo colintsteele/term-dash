@@ -286,18 +286,20 @@ Both signals are *100% local* — files, `git`, `ps`, SQLite, a URL scheme.
 
 ### The rest of the layout
 
-term-dash is this worktree panel plus a few sibling widgets, tiled by the
-`termdash` bash launcher into a status strip over three columns:
+The worktree panel above is **retired from the layout**: Herdr's sidebar shows
+the same worktree + agent state, so `termdash` no longer starts
+`cursor-status.ts` (it still runs on its own). The `termdash` bash launcher tiles
+the remaining widgets into a status strip over three columns:
 
 ```
 ┌──────────────────────────── local-status ────────────────────────────┐
 ├──────────────┬────────────────────────────┬──────────────────────────┤
-│  worktrees   │                            │       git-notiql         │
-│  + agents    │        plain shell         │                          │
-│ (cursor-     │      (your terminal)       │                          │
-│  status)     │                            ├──────────────────────────┤
-├──────────────┤                            │       notion-todo        │
-│    peers     │                            │                          │
+│    peers     │                            │       git-notiql         │
+│              │        plain shell         │                          │
+│              │      (your terminal)       │                          │
+│              │                            ├──────────────────────────┤
+│              │                            │       notion-todo        │
+│              │                            │                          │
 └──────────────┴────────────────────────────┴──────────────────────────┘
    left, 15%            middle, 70%                  right, 15%
 ```

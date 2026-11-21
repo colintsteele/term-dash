@@ -2,7 +2,7 @@
 #
 # termdash — tmux dashboard: a full-width status strip over a 3-column layout
 #   ┌─────────────── local-status (1 row, spans everything) ───────────────┐
-#   [left, 15%: worktrees]  [middle, 70%: fat terminal]  [right, 15%: git-notiql / Notion to-do]
+#   [left, 15%: peers]  [middle, 70%: fat terminal]  [right, 15%: git-notiql / Notion to-do]
 #
 # local-status was a box in the left column; it is now the strip across the top.
 # It reads left-justified/centered/right-justified, so it needs the whole window
@@ -39,9 +39,10 @@ set -euo pipefail
 # Layout: [full-width status strip] over [left, 15%] [middle, 70%] [right, 15%]
 #   top strip:    local-status — clock/battery left, key alerts centered,
 #                 CPU/MEM/:3000 right. Spans the full window width.
-#   left column: top = worktrees (our CI-focused panel — CI status is folded
-#                 into each row), bottom = peers (what the rest of the team is
-#                 working on, from Shortcut)
+#   left column: peers (what the rest of the team is working on, from
+#                 Shortcut). The worktrees/agent panel (cursor-status.ts) that
+#                 used to sit above it is retired — Herdr's sidebar shows the
+#                 same worktree + agent state now.
 #   middle:       plain terminal, no command — just a normal shell
 #   right column: top = git-notiql (remainder), bottom = Notion to-do
 #                 (this week's list — click a row to check it off, type to add)
@@ -77,21 +78,15 @@ STATUS_CMD="npx tsx local-status.ts"
 # to be seen. The pane's environment is the only place it can live.
 PANE_ENV="-e SPINNER_OFF=1"
 
-# worktrees panel — replaces the standalone circleci panel; CI status is folded
-# into each worktree row (colored ● dot), so this is now our CI-focused panel.
-LEFT_CMD="npx tsx cursor-status.ts"
-
-# peers panel — one block per teammate under the worktrees: a name line plus up
-# to two ticket rows.
+# peers panel — the whole left column: one block per teammate, a name line plus
+# up to two ticket rows.
 #
-# This is only the STARTING height. The pane resizes itself to the rows it
-# actually prints (see selfSize in shortcut-peers.ts) and hands the slack back to
-# the worktrees panel above, so worktrees grows on its own when a teammate has
-# nothing on. Nothing here needs adjusting when the team's workload changes; the
-# only knob is PEERS_MAX_ROWS in that file, which is what reserves a floor for
-# worktrees. TERMDASH_NO_AUTOSIZE=1 pins it to this value instead.
-LEFT_BOTTOM_HEIGHT=12
-LEFT_BOTTOM_CMD="npx tsx shortcut-peers.ts"
+# TERMDASH_NO_AUTOSIZE=1 because peers is alone in its column now. Its selfSize
+# (shortcut-peers.ts) resizes the pane to fit its rows and hands the slack to the
+# pane above it; with no pane above, `resize-pane -y` would resize the whole row
+# under the status strip and make the strip taller instead.
+LEFT_CMD="npx tsx shortcut-peers.ts"
+LEFT_ENV="-e TERMDASH_NO_AUTOSIZE=1"
 
 # right column: git-notiql takes the remainder (top), Notion to-do fixed (bottom).
 # The to-do pane is now a scrollable list of this week's items, not just an input
@@ -410,7 +405,7 @@ up() {
 
   # peel the LEFT column off first (this pane keeps its id, shrinks to the
   # right, and becomes the middle pane once the right column is also peeled)
-  left_pane=$(tmux split-window -h -b -p "$LEFT_WIDTH_PCT" -t "$remainder" $PANE_ENV \
+  left_pane=$(tmux split-window -h -b -p "$LEFT_WIDTH_PCT" -t "$remainder" $PANE_ENV $LEFT_ENV \
     -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
 
   # peel the RIGHT column off what's left. RIGHT_WIDTH_PCT is a fraction of
@@ -422,13 +417,8 @@ up() {
   # remainder is now the middle pane — deliberately left as a plain shell,
   # no command sent
 
-  # left column, top→bottom: worktrees (remainder), peers (fixed, small). Same
-  # shape as the right column — peel the fixed bottom pane off and let the top
-  # one keep its id and take whatever height is left.
-  left_bottom=$(tmux split-window -v -l "$LEFT_BOTTOM_HEIGHT" -t "$left_pane" $PANE_ENV \
-    -c "$DASHBOARD_DIR" -P -F '#{pane_id}')
+  # left column: peers alone, full height.
   tmux send-keys -t "$left_pane" "clear && $LEFT_CMD" Enter
-  tmux send-keys -t "$left_bottom" "clear && $LEFT_BOTTOM_CMD" Enter
 
   # right column, top→bottom: git-notiql (remainder), Notion to-do (fixed,
   # small). Peel the fixed bottom pane off; right_pane keeps its id and stays
